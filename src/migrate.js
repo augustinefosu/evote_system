@@ -18,6 +18,8 @@ const SCHEMA_PATH = path.join(__dirname, '..', 'supabase', 'schema.sql');
 // a missing-table error on the first request.
 const REQUIRED_TABLES = [
   'users',
+  'email_verifications',
+  'password_resets',
   'elections',
   'positions',
   'candidates',

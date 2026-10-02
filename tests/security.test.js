@@ -10,15 +10,14 @@ const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
-const fs = require('node:fs');
-const os = require('node:os');
+const { createTestDatabase } = require('./helpers/pg-test-db');
 
 const PORT = 3212;
 const BASE = `http://127.0.0.1:${PORT}`;
 const ROOT = path.join(__dirname, '..');
-const DB = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'evs-sec-')), 'sec.db');
 
 let server;
+let testDb;
 let serverLog = '';
 
 async function waitReady(tries = 60) {
@@ -97,12 +96,14 @@ let adminToken, superToken;
 const lifecycle = {};
 
 before(async () => {
+  testDb = await createTestDatabase();
   server = spawn('node', ['src/server.js'], {
     cwd: ROOT,
     env: {
       ...process.env,
       PORT: String(PORT),
-      DB_PATH: DB,
+      SUPABASE_DB_URL: testDb.url,
+      SUPABASE_DB_SSL: 'false',
       JWT_SECRET: 'sec-test-secret-min-32-chars-0123456789',
       ADMIN_SETUP_KEY: 'sec-setup-key',
       // Long window so the lockout test, not the rate limiter, is what fails.
@@ -131,7 +132,10 @@ before(async () => {
   state.voterId = reg.body.user_id;
 });
 
-after(() => { if (server && !server.killed) server.kill(); });
+after(async () => {
+  if (server && !server.killed) server.kill();
+  if (testDb) await testDb.drop();
+});
 
 describe('transport & headers', () => {
   it('sends a strict Content-Security-Policy that forbids inline scripts', async () => {

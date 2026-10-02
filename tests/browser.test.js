@@ -21,6 +21,7 @@ const { spawn } = require('node:child_process');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
+const { createTestDatabase } = require('./helpers/pg-test-db');
 
 const ROOT = path.join(__dirname, '..');
 const PORT = Number(process.env.BROWSER_TEST_PORT || 3213);
@@ -50,6 +51,7 @@ let server;
 let serverLog = '';
 let browser;
 let profileDir;
+let testDb;
 let cdp;
 let targetId;
 let sessionId;
@@ -313,15 +315,15 @@ describe('browser runtime', { skip: skipReason }, () => {
   before(async () => {
     if (!browserBin) return;
 
-    const DB = path.join(os.tmpdir(), `evoting-browser-${process.pid}.db`);
-    for (const suffix of ['', '-shm', '-wal']) { try { fs.unlinkSync(DB + suffix); } catch { /* fresh */ } }
+    testDb = await createTestDatabase();
 
     server = spawn('node', ['src/server.js'], {
       cwd: ROOT,
       env: {
         ...process.env,
         PORT: String(PORT),
-        DB_PATH: DB,
+        SUPABASE_DB_URL: testDb.url,
+        SUPABASE_DB_SSL: 'false',
         JWT_SECRET: 'browser-test-secret-min-32-chars-0123456789',
         ADMIN_SETUP_KEY: 'browser-key',
         SCHEDULER_MS: '60000',
@@ -413,6 +415,7 @@ describe('browser runtime', { skip: skipReason }, () => {
         await wait(300);
       }
     }
+    if (testDb) await testDb.drop();
   });
 
   // The current page label, used to attribute diagnostics collected by events.

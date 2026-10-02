@@ -6,15 +6,14 @@ const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert/strict');
 const { spawn } = require('node:child_process');
 const path = require('node:path');
-const fs = require('node:fs');
-const os = require('node:os');
+const { createTestDatabase } = require('./helpers/pg-test-db');
 
 const PORT = 3211;
 const BASE = `http://127.0.0.1:${PORT}`;
 const ROOT = path.join(__dirname, '..');
-const DB = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'evs-test-')), 'test.db');
 
 let server;
+let testDb;
 
 async function waitReady(tries = 60) {
   for (let i = 0; i < tries; i++) {
@@ -44,17 +43,19 @@ let superToken, adminToken, voterToken, voter2Token;
 let electionId, posPres, posVp, candA, candB, candC;
 
 before(async () => {
+  testDb = await createTestDatabase();
   server = spawn('node', ['src/server.js'], {
     cwd: ROOT,
-    env: { ...process.env, PORT: String(PORT), DB_PATH: DB, JWT_SECRET: 'test-secret-min-32-chars-0123456789abcdef', ADMIN_SETUP_KEY: 'test-setup-key', SCHEDULER_MS: '1000' },
+    env: { ...process.env, PORT: String(PORT), SUPABASE_DB_URL: testDb.url, SUPABASE_DB_SSL: 'false', JWT_SECRET: 'test-secret-min-32-chars-0123456789abcdef', ADMIN_SETUP_KEY: 'test-setup-key', SCHEDULER_MS: '1000' },
     stdio: 'pipe',
   });
   server.stderr.on('data', () => {});
   await waitReady();
 });
 
-after(() => {
+after(async () => {
   if (server && !server.killed) server.kill();
+  if (testDb) await testDb.drop();
 });
 
 describe('bootstrap & auth', () => {

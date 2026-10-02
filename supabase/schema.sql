@@ -4,7 +4,7 @@
 -- Run this once in the Supabase SQL Editor, or with:
 --   psql "$SUPABASE_DB_URL" -v ON_ERROR_STOP=1 -f supabase/schema.sql
 --
--- It is a faithful translation of the SQLite schema in src/db.js. Two
+-- It is a faithful translation of the system's original SQLite schema. Two
 -- deliberate departures from SQLite, both required by Postgres:
 --
 --   1. Flag columns (verified, is_active, is_abstain, is_mandatory,
@@ -325,10 +325,34 @@ begin
   end if;
 end $$;
 
-revoke all on function public.cast_vote(integer, integer, text, jsonb) from public;
+-- CRITICAL: Supabase also sets ALTER DEFAULT PRIVILEGES so that every function
+-- created in `public` automatically gets EXECUTE for anon and authenticated.
+-- Revoking from PUBLIC alone therefore does nothing here — those grants are
+-- explicit, not implicit.
+--
+-- Left unfixed, cast_vote() is reachable by anyone at the PostgREST /rest/v1/
+-- rpc/cast_vote endpoint using only the public anon key. It is SECURITY
+-- DEFINER, so it would run past Row Level Security with none of this
+-- application's checks: no eligibility test, no email-verification test, no
+-- election-window test, no min/max selection validation. Anyone could insert
+-- ballots into a live election. The trigger functions below are exposed the
+-- same way and can disable or fabricate accounts.
+--
+-- Explicitly named rather than "all functions", so Supabase's own internal
+-- helpers are left untouched.
+revoke all on function public.cast_vote(integer, integer, text, jsonb),
+  public.handle_auth_user_upsert(),
+  public.handle_auth_user_delete()
+  from public;
 
 do $$
 begin
+  if exists (select 1 from pg_roles where rolname = 'anon')
+     and exists (select 1 from pg_roles where rolname = 'authenticated') then
+    execute 'revoke all on function public.cast_vote(integer, integer, text, jsonb) from anon, authenticated';
+    execute 'revoke all on function public.handle_auth_user_upsert() from anon, authenticated';
+    execute 'revoke all on function public.handle_auth_user_delete() from anon, authenticated';
+  end if;
   if exists (select 1 from pg_roles where rolname = 'service_role') then
     execute 'grant execute on function public.cast_vote(integer, integer, text, jsonb) to service_role';
   end if;

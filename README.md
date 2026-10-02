@@ -11,13 +11,15 @@ manage accounts, roles, audit logs and platform settings.
 cd university-evoting-system
 npm install
 Copy-Item .env.example .env      # then edit the secrets
-npm run seed                     # demo users + 2026 SRC GENERAL ELECTION
+npm run seed                     # demo data -> the Postgres in SUPABASE_DB_URL
 npm start                        # http://localhost:3000
-npm test                         # 77 tests, isolated temp databases
+npm test                         # 77 tests, isolated temp Postgres databases
 ```
 
-Node.js 22.5+ is required (the project uses the built-in `node:sqlite` module — no native
-database driver to compile, and no build step for the frontend).
+Node.js 22.5+ is required (global `fetch`/`WebSocket` for the API and browser test suites). The
+application talks to Postgres through the pure-JavaScript `pg` driver — no native module to compile
+— and the frontend has no build step. Only the legacy SQLite backup path needs the built-in
+`node:sqlite`.
 
 ## Demo accounts (seeded)
 
@@ -56,18 +58,18 @@ database driver to compile, and no build step for the frontend).
 
 ```
 src/server.js       Express API, security middleware and static frontend
-src/db.js           SQLite schema, additive migrations and default settings (node:sqlite, WAL)
+src/db-pg.js        Postgres adapter: prepare().get/.all/.run, ?→$n, transactions
 src/env.js          Shared .env loader (no dependency)
 src/supabase.js     Supabase Postgres pool + query/transaction helpers, Supabase Auth client
-src/auth.js         Supabase Auth middleware (authRequired, requireRole)
+src/auth.js         Supabase Auth middleware (authRequired, requireRole) — scaffolded, not yet wired in
 supabase/schema.sql Postgres schema, cast_vote() and the auth-to-profile triggers
 src/seed.js         Demo election, positions, candidates and users
 src/mailer.js       SMTP transport with an in-app/log fallback
-src/backup.js       Hot SQLite backup to backups/evoting-<timestamp>.db
+src/backup.js       pg_dump backup (SQLite fallback kept for legacy databases)
 public/             Responsive HTML/CSS/JS, no build step and no CDN dependencies
 uploads/            Candidate photos (served inertly)
-tests/              node:test suites: API, security and mailer
-evoting.db          Created on first run
+tests/              node:test suites: API, security, mailer, browser
+tests/helpers/      One disposable Postgres database per test run
 ```
 
 Every page loads its behaviour from a file under `/js`. No inline `<script>` or `on*=` handler
@@ -75,9 +77,14 @@ exists anywhere in `public/`, which is what allows the strict CSP to stay strict
 
 ## Supabase backend
 
-The app runs on SQLite by default. `src/supabase.js` and `supabase/schema.sql` add a Postgres
-backend, with **Supabase Auth** replacing the local `jsonwebtoken` sessions. Roles stay in the
-app's own `users` table, which the voting logic and admin console both read.
+The application runs on **Postgres** (Supabase). `src/db-pg.js` presents the same
+`prepare().get/.all/.run` surface the routes were originally written against, but asynchronous and
+against Postgres: `?` placeholders are rewritten to `$1..$n`, and `db.transaction()` binds every
+statement in its callback to a single pooled connection via `AsyncLocalStorage`, so nested
+`db.prepare()` calls join the transaction.
+
+Authentication still uses the app's own `users` table and its JWT sessions. Supabase Auth is
+scaffolded (`src/auth.js`, the `auth.users` link, and the sync triggers) but not yet switched on.
 
 Setup:
 
@@ -92,10 +99,10 @@ Setup:
 
 Two things carry over deliberately and should not be "cleaned up":
 
-- **Vote atomicity.** `db.transaction()` has no PostgREST equivalent, so casting a ballot is a
-  Postgres function, `public.cast_vote()`, which is atomic by definition. The
-  `vote_receipts_election_voter_key` unique constraint — not application code — is what prevents a
-  double vote.
+- **Vote atomicity.** Casting a ballot runs inside one Postgres transaction (`db.transaction()` in
+  `src/db-pg.js`) that holds a single pooled connection for the receipt and every ballot it writes.
+  The `vote_receipts_election_voter_key` unique constraint — not application code — is what prevents
+  a double vote; the schema also ships an equivalent server-side `cast_vote()` function.
 - **Ballot secrecy.** `ballots` has no voter column and `vote_receipts` stores no choices, so the
   two tables can never be joined to reveal how anyone voted. Row Level Security is enabled with no
   policies: `anon` and `authenticated` get nothing, and the API server connects with the service
@@ -140,11 +147,13 @@ The `results_visibility` setting controls who may read results before they are p
 ## Tests
 
 ```powershell
+# Requires a local or disposable Postgres. Each test file creates and drops its
+# own database. Point TEST_PG_ADMIN_URL at it in .env.local (see .env.example).
 npm test
 ```
 
-77 tests across four suites, each against a throwaway database and its own port (3211–3213), so a
-running development server is never disturbed:
+77 tests across four suites, each against a throwaway **Postgres database** and its own port
+(3211–3213), so a running development server is never disturbed:
 
 - `tests/evoting.test.js` — registration, verification, the one-ballot guarantee under concurrency,
   election lifecycle transitions, results, CSV import/export, the scheduler and audit logging.

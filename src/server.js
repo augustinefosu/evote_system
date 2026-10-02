@@ -17,7 +17,7 @@ const multer = require('multer');
 const crypto = require('crypto');
 const uuidv4 = () => crypto.randomUUID();
 
-const db = require('./db');
+const db = require('./db-pg');
 const mailer = require('./mailer');
 const supabase = require('./supabase');
 
@@ -256,14 +256,19 @@ app.use((req, res, next) => {
 
 
 // ---------- helpers ----------
-function audit(actorId, action, details, req) {
+// Audit, setting reads and auth lookups all go through the Postgres adapter, so
+// every helper below is async and its call sites await it. audit() is the one
+// exception callers leave un-awaited: it is a fire-and-forget logger, and its
+// own try/catch swallows failures (including a rejected await) so a logging
+// problem can never surface as an unhandled rejection.
+async function audit(actorId, action, details, req) {
   try {
-    db.prepare('INSERT INTO audit_logs(actor_id, action, details, ip) VALUES(?,?,?,?)')
+    await db.prepare('INSERT INTO audit_logs(actor_id, action, details, ip) VALUES(?,?,?,?)')
       .run(actorId || null, action, details || '', (req && (req.ip || '')) || '');
   } catch {}
 }
-function getSetting(key, fallback) {
-  const row = db.prepare('SELECT value FROM settings WHERE key=?').get(key);
+async function getSetting(key, fallback) {
+  const row = await db.prepare('SELECT value FROM settings WHERE key=?').get(key);
   return row ? row.value : fallback;
 }
 function signToken(user) {
@@ -275,14 +280,14 @@ function getTokenFromReq(req) {
   if (h.startsWith('Bearer ')) return h.slice(7);
   return null;
 }
-function authRequired(req, res, next) {
+async function authRequired(req, res, next) {
   const token = getTokenFromReq(req);
   if (!token) return res.status(401).json({ error: 'Not authenticated' });
   try {
     const payload = jwt.verify(token, JWT_SECRET);
     // Role is always re-read from the database so a demoted or disabled account
     // loses access immediately instead of when its token happens to expire.
-    const user = db.prepare('SELECT id, student_id, name, email, role, faculty, department, level, verified, is_active FROM users WHERE id=?').get(payload.id);
+    const user = await db.prepare('SELECT id, student_id, name, email, role, faculty, department, level, verified, is_active FROM users WHERE id=?').get(payload.id);
     if (!user || !user.is_active) return res.status(401).json({ error: 'Account disabled or not found' });
     req.user = user;
     next();
@@ -327,24 +332,25 @@ function normaliseTimezone(tz) {
 
 // ---------- brute-force protection ----------
 const LOCK_WINDOW_MS = 15 * 60 * 1000;
-function recordLoginAttempt(identifier, ip, ok) {
+async function recordLoginAttempt(identifier, ip, ok) {
   try {
-    // created_at is written explicitly as ISO-8601. SQLite's datetime('now')
-    // default yields 'YYYY-MM-DD HH:MM:SS', and because ' ' sorts before 'T'
-    // those rows never compare as newer than the ISO cutoff used below — which
-    // would silently disable the lockout entirely.
-    db.prepare('INSERT INTO login_attempts(identifier, ip, ok, created_at) VALUES(?,?,?,?)')
+    // created_at is written explicitly as ISO-8601. The column is text and the
+    // lockout query below compares it as a string, so the default must keep the
+    // 'T' separator: ' ' sorts before 'T', and rows stamped with a space would
+    // never compare as newer than the ISO cutoff — which would silently disable
+    // the lockout entirely.
+    await db.prepare('INSERT INTO login_attempts(identifier, ip, ok, created_at) VALUES(?,?,?,?)')
       .run(String(identifier).slice(0, 120), ip || '', ok ? 1 : 0, new Date().toISOString());
   } catch {}
 }
-function recentFailures(identifier) {
+async function recentFailures(identifier) {
   const since = new Date(Date.now() - LOCK_WINDOW_MS).toISOString();
-  const row = db.prepare('SELECT COUNT(*) c FROM login_attempts WHERE identifier=? AND ok=0 AND created_at > ?')
+  const row = await db.prepare('SELECT COUNT(*) c FROM login_attempts WHERE identifier=? AND ok=0 AND created_at > ?')
     .get(String(identifier).slice(0, 120), since);
   return row.c;
 }
-function clearLoginFailures(identifier) {
-  try { db.prepare('DELETE FROM login_attempts WHERE identifier=? AND ok=0').run(String(identifier).slice(0, 120)); } catch {}
+async function clearLoginFailures(identifier) {
+  try { await db.prepare('DELETE FROM login_attempts WHERE identifier=? AND ok=0').run(String(identifier).slice(0, 120)); } catch {}
 }
 
 // ---------- notifications ----------
@@ -352,7 +358,7 @@ function clearLoginFailures(identifier) {
 // queryable, shown in-app) and then handed to the mailer. If SMTP is not
 // configured the mailer logs instead of sending, so no code path needs to know
 // whether a provider is present.
-function notify(userId, { type, title, body, electionId = null, email = null }) {
+async function notify(userId, { type, title, body, electionId = null, email = null }) {
   let notificationId = null;
   // The notifications.status column is constrained to pending/sent/failed, so
   // an in-app-only notice is recorded as already 'sent'. When SMTP is not
@@ -360,18 +366,20 @@ function notify(userId, { type, title, body, electionId = null, email = null }) 
   const willEmail = Boolean(email) && mailer.isConfigured();
   const now = new Date().toISOString();
   try {
-    notificationId = db.prepare(
+    // RETURNING id is required: the Postgres adapter can only report the
+    // generated key when the statement asks for it.
+    notificationId = (await db.prepare(
       `INSERT INTO notifications(user_id, election_id, type, title, body, channel, status, sent_at)
-       VALUES(?,?,?,?,?,?,?,?)`
+       VALUES(?,?,?,?,?,?,?,?) RETURNING id`
     ).run(userId, electionId, type, title, body || '', willEmail ? 'email' : 'inapp',
-      willEmail ? 'pending' : 'sent', willEmail ? null : now).lastInsertRowid;
+      willEmail ? 'pending' : 'sent', willEmail ? null : now)).lastInsertRowid;
   } catch { /* a notification must never break the request that triggered it */ }
 
   if (!willEmail) return notificationId;
-  const finish = (status) => {
+  const finish = async (status) => {
     if (notificationId === null) return;
     try {
-      db.prepare('UPDATE notifications SET status=?, sent_at=? WHERE id=?')
+      await db.prepare('UPDATE notifications SET status=?, sent_at=? WHERE id=?')
         .run(status, new Date().toISOString(), notificationId);
     } catch { /* ignore */ }
   };
@@ -382,19 +390,19 @@ function notify(userId, { type, title, body, electionId = null, email = null }) 
 }
 // Broadcast to every voter eligible for an election. Eligible means the explicit
 // roll when one exists, otherwise all active verified students.
-function eligibleVoterIds(electionId) {
-  const roll = db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(electionId).c;
+async function eligibleVoterIds(electionId) {
+  const roll = (await db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(electionId)).c;
   if (roll > 0) {
-    return db.prepare(
+    return await db.prepare(
       'SELECT u.id, u.email FROM users u JOIN voter_eligibility e ON e.user_id = u.id WHERE e.election_id=? AND u.is_active=1'
     ).all(electionId);
   }
-  return db.prepare("SELECT id, email FROM users WHERE role='voter' AND is_active=1 AND verified=1").all();
+  return await db.prepare("SELECT id, email FROM users WHERE role='voter' AND is_active=1 AND verified=1").all();
 }
-function notifyEligibleVoters(electionId, { type, title, body }) {
+async function notifyEligibleVoters(electionId, { type, title, body }) {
   let sent = 0;
-  for (const v of eligibleVoterIds(electionId)) {
-    notify(v.id, { type, title, body, electionId, email: v.email });
+  for (const v of await eligibleVoterIds(electionId)) {
+    await notify(v.id, { type, title, body, electionId, email: v.email });
     sent++;
   }
   return sent;
@@ -406,11 +414,11 @@ function notifyEligibleVoters(electionId, { type, title, body }) {
 // green container that cannot serve a single request.
 app.get('/api/health', async (req, res) => {
   let dbOk = true;
-  const usingSupabase = supabase.isConfigured();
-  const backend = usingSupabase ? 'supabase' : 'sqlite';
+  const backend = 'supabase';
   try {
-    if (usingSupabase) await supabase.scalar('SELECT 1 AS ok');
-    else db.prepare('SELECT 1 AS ok').get();
+    // The application now runs entirely on Postgres, so there is a single probe:
+    // one awaited round-trip through the same pool every route uses.
+    await db.prepare('SELECT 1 AS ok').get();
   } catch (err) {
     dbOk = false;
     console.error('[health] backend check failed:', err.message);
@@ -418,7 +426,7 @@ app.get('/api/health', async (req, res) => {
   res.status(dbOk ? 200 : 503).json({ status: dbOk ? 'ok' : 'degraded', time: new Date().toISOString(), db: dbOk ? 'up' : 'down', backend });
 });
 app.post('/api/auth/register', async (req, res) => {
-  const allow = db.prepare("SELECT value FROM settings WHERE key='allow_registration'").get();
+  const allow = await db.prepare("SELECT value FROM settings WHERE key='allow_registration'").get();
   if (allow && allow.value === '0') return res.status(403).json({ error: 'Registration is currently disabled' });
   let { name, student_id, email, password, faculty, department, level } = req.body || {};
   name = (name || '').trim(); student_id = (student_id || '').trim().toUpperCase();
@@ -428,14 +436,14 @@ app.post('/api/auth/register', async (req, res) => {
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return res.status(400).json({ error: 'Invalid email address' });
   if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   if (!/^[A-Z0-9\-\/]{3,30}$/i.test(student_id)) return res.status(400).json({ error: 'Invalid Student ID format' });
-  const exists = db.prepare('SELECT id FROM users WHERE email=? OR student_id=?').get(email, student_id);
+  const exists = await db.prepare('SELECT id FROM users WHERE email=? OR student_id=?').get(email, student_id);
   if (exists) return res.status(409).json({ error: 'Email or Student ID already registered' });
   const hash = bcrypt.hashSync(password, 12);
-  const info = db.prepare('INSERT INTO users(name, student_id, email, password_hash, role, faculty, department, level, verified) VALUES(?,?,?,?,?,?,?,?,?)')
+  const info = await db.prepare('INSERT INTO users(name, student_id, email, password_hash, role, faculty, department, level, verified) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id')
     .run(name, student_id, email, hash, 'voter', faculty, department, level, 0);
   const token = uuidv4();
   const exp = new Date(Date.now() + 24*3600*1000).toISOString();
-  db.prepare('INSERT INTO email_verifications(user_id, token, expires_at) VALUES(?,?,?)').run(info.lastInsertRowid, token, exp);
+  await db.prepare('INSERT INTO email_verifications(user_id, token, expires_at) VALUES(?,?,?)').run(info.lastInsertRowid, token, exp);
   audit(info.lastInsertRowid, 'user.register', `Registered ${email}`, req);
   const vm = mailer.verificationMail(name, token);
   const mail = await mailer.sendMail(email, vm.subject, vm.text, vm.html).catch(() => ({ sent: false }));
@@ -447,16 +455,16 @@ app.post('/api/auth/register', async (req, res) => {
   res.json(out);
 });
 
-app.post('/api/auth/verify', (req, res) => {
+app.post('/api/auth/verify', async (req, res) => {
   const { token } = req.body || {};
   if (!token) return res.status(400).json({ error: 'Verification token required' });
-  const row = db.prepare('SELECT * FROM email_verifications WHERE token=? AND used=0').get(token);
+  const row = await db.prepare('SELECT * FROM email_verifications WHERE token=? AND used=0').get(token);
   if (!row) return res.status(400).json({ error: 'Invalid or used token' });
   if (new Date(row.expires_at) < new Date()) return res.status(400).json({ error: 'Token expired' });
-  db.prepare('UPDATE users SET verified=1 WHERE id=?').run(row.user_id);
-  db.prepare('UPDATE email_verifications SET used=1 WHERE id=?').run(row.id);
-  const who = db.prepare('SELECT email FROM users WHERE id=?').get(row.user_id);
-  notify(row.user_id, {
+  await db.prepare('UPDATE users SET verified=1 WHERE id=?').run(row.user_id);
+  await db.prepare('UPDATE email_verifications SET used=1 WHERE id=?').run(row.id);
+  const who = await db.prepare('SELECT email FROM users WHERE id=?').get(row.user_id);
+  await notify(row.user_id, {
     type: 'account.verified',
     title: 'Your E-Voting account is verified',
     body: 'Your student account has been verified. You can now log in and vote in any election you are eligible for.',
@@ -466,7 +474,7 @@ app.post('/api/auth/verify', (req, res) => {
   res.json({ message: 'Account verified successfully. You can now log in and vote (if eligible).' });
 });
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   let { identifier, password } = req.body || {};
   identifier = (identifier || '').trim();
   if (!identifier || !password) return res.status(400).json({ error: 'Student ID / Email and password are required' });
@@ -475,34 +483,34 @@ app.post('/api/auth/login', (req, res) => {
   // is normalised the same way as the lookup so "Ama@x.edu" and "ama@x.edu"
   // share one failure counter.
   const norm = identifier.includes('@') ? identifier.toLowerCase() : identifier.toUpperCase();
-  const maxAttempts = Math.max(1, Number(getSetting('max_login_attempts', '5')) || 5);
-  if (recentFailures(norm) >= maxAttempts) {
-    recordLoginAttempt(norm, req.ip, false);
+  const maxAttempts = Math.max(1, Number(await getSetting('max_login_attempts', '5')) || 5);
+  if (await recentFailures(norm) >= maxAttempts) {
+    await recordLoginAttempt(norm, req.ip, false);
     return res.status(429).json({ error: `Too many failed attempts. Try again in ${LOCK_WINDOW_MS / 60000} minutes.` });
   }
 
-  const user = db.prepare("SELECT * FROM users WHERE email=? OR student_id=?").get(identifier.toLowerCase(), identifier.toUpperCase());
+  const user = await db.prepare("SELECT * FROM users WHERE email=? OR student_id=?").get(identifier.toLowerCase(), identifier.toUpperCase());
   if (!user) {
     // Uniform failure handling: unknown account and wrong password are
     // indistinguishable, and both cost the same bcrypt work.
     bcrypt.compareSync(password, '$2a$12$invalidinvalidinvalidinvalidinvalidinvalidinvalidinvalidin');
-    recordLoginAttempt(norm, req.ip, false);
+    await recordLoginAttempt(norm, req.ip, false);
     return res.status(401).json({ error: 'Invalid credentials' });
   }
   if (!user.is_active) {
-    recordLoginAttempt(norm, req.ip, false);
+    await recordLoginAttempt(norm, req.ip, false);
     return res.status(403).json({ error: 'Account disabled. Contact administrator.' });
   }
   if (!bcrypt.compareSync(password, user.password_hash)) {
-    recordLoginAttempt(norm, req.ip, false);
+    await recordLoginAttempt(norm, req.ip, false);
     audit(user.id, 'auth.login_failed', identifier, req);
     return res.status(401).json({ error: 'Invalid credentials' });
   }
-  clearLoginFailures(norm);
-  recordLoginAttempt(norm, req.ip, true);
+  await clearLoginFailures(norm);
+  await recordLoginAttempt(norm, req.ip, true);
 
   const token = signToken(user);
-  const sessionHours = Math.max(1, Number(getSetting('session_hours', '12')) || 12);
+  const sessionHours = Math.max(1, Number(await getSetting('session_hours', '12')) || 12);
   res.cookie('evs_token', token, {
     httpOnly: true,
     sameSite: 'lax',
@@ -523,13 +531,13 @@ app.post('/api/auth/logout', (req, res) => {
 app.post('/api/auth/forgot', async (req, res) => {
   const { email } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email required' });
-  const user = db.prepare('SELECT * FROM users WHERE email=?').get(String(email).toLowerCase().trim());
+  const user = await db.prepare('SELECT * FROM users WHERE email=?').get(String(email).toLowerCase().trim());
   // Always return generic message to avoid enumeration
   if (!user) return res.json({ message: 'If the email exists, a reset link has been generated.' });
   const raw = crypto.randomBytes(24).toString('hex');
   const tokenHash = crypto.createHash('sha256').update(raw).digest('hex');
   const exp = new Date(Date.now() + 3600*1000).toISOString();
-  db.prepare('INSERT INTO password_resets(user_id, token_hash, expires_at) VALUES(?,?,?)').run(user.id, tokenHash, exp);
+  await db.prepare('INSERT INTO password_resets(user_id, token_hash, expires_at) VALUES(?,?,?)').run(user.id, tokenHash, exp);
   audit(user.id, 'auth.forgot', user.email, req);
   const rm = mailer.resetMail(user.name, raw);
   await mailer.sendMail(user.email, rm.subject, rm.text, rm.html).catch(() => ({}));
@@ -539,69 +547,70 @@ app.post('/api/auth/forgot', async (req, res) => {
   res.json(out);
 });
 
-app.post('/api/auth/reset', (req, res) => {
+app.post('/api/auth/reset', async (req, res) => {
   const { token, new_password } = req.body || {};
   if (!token || !new_password) return res.status(400).json({ error: 'Token and new password required' });
   if (String(new_password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
   const h = crypto.createHash('sha256').update(String(token)).digest('hex');
-  const row = db.prepare('SELECT * FROM password_resets WHERE token_hash=? AND used=0').get(h);
+  const row = await db.prepare('SELECT * FROM password_resets WHERE token_hash=? AND used=0').get(h);
   if (!row) return res.status(400).json({ error: 'Invalid or used token' });
   if (new Date(row.expires_at) < new Date()) return res.status(400).json({ error: 'Token expired' });
-  db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(new_password, 12), row.user_id);
-  db.prepare('UPDATE password_resets SET used=1 WHERE id=?').run(row.id);
+  await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(new_password, 12), row.user_id);
+  await db.prepare('UPDATE password_resets SET used=1 WHERE id=?').run(row.id);
   audit(row.user_id, 'auth.reset', 'Password reset', req);
   res.json({ message: 'Password reset successful. Please log in.' });
 });
 
 app.get('/api/auth/me', authRequired, (req, res) => res.json({ user: req.user }));
 
-app.post('/api/auth/change-password', authRequired, (req, res) => {
+app.post('/api/auth/change-password', authRequired, async (req, res) => {
   const { current_password, new_password } = req.body || {};
   if (!current_password || !new_password) return res.status(400).json({ error: 'Current and new passwords required' });
   if (String(new_password).length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
-  const user = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  const user = await db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
   if (!bcrypt.compareSync(current_password, user.password_hash)) return res.status(401).json({ error: 'Current password is incorrect' });
-  db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(new_password, 12), user.id);
+  await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(new_password, 12), user.id);
   audit(user.id, 'auth.change_password', user.email, req);
   res.json({ message: 'Password changed successfully.' });
 });
 
 // ---------- PUBLIC / STUDENT ----------
-app.get('/api/settings/public', (req, res) => {
-  const rows = db.prepare("SELECT key,value FROM settings WHERE key IN ('school_name','results_visibility')").all();
+app.get('/api/settings/public', async (req, res) => {
+  const rows = await db.prepare("SELECT key,value FROM settings WHERE key IN ('school_name','results_visibility')").all();
   res.json(Object.fromEntries(rows.map(r => [r.key, r.value])));
 });
 
-app.get('/api/elections', authRequired, (req, res) => {
-  const elections = db.prepare('SELECT * FROM elections ORDER BY starts_at DESC').all().map(withComputed);
+app.get('/api/elections', authRequired, async (req, res) => {
+  const elections = (await db.prepare('SELECT * FROM elections ORDER BY starts_at DESC').all()).map(withComputed);
   // attach voter state for this user
-  const out = elections.map(e => {
-    const elig = db.prepare('SELECT 1 FROM voter_eligibility WHERE election_id=? AND user_id=?').get(e.id, req.user.id);
+  const out = [];
+  for (const e of elections) {
+    const elig = await db.prepare('SELECT 1 FROM voter_eligibility WHERE election_id=? AND user_id=?').get(e.id, req.user.id);
     // if no eligibility rows exist for election, treat as open to all verified students
-    const eligCount = db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(e.id).c;
+    const eligCount = (await db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(e.id)).c;
     const eligible = eligCount === 0 ? true : !!elig;
-    const voted = !!db.prepare('SELECT 1 FROM vote_receipts WHERE election_id=? AND voter_id=?').get(e.id, req.user.id);
-    const votesCast = db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(e.id).c;
-    return { ...e, eligible, voted, votes_cast: votesCast };
-  });
+    const voted = !!await db.prepare('SELECT 1 FROM vote_receipts WHERE election_id=? AND voter_id=?').get(e.id, req.user.id);
+    const votesCast = (await db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(e.id)).c;
+    out.push({ ...e, eligible, voted, votes_cast: votesCast });
+  }
   res.json(out);
 });
 
-app.get('/api/elections/:id', authRequired, (req, res) => {
-  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id);
+app.get('/api/elections/:id', authRequired, async (req, res) => {
+  const e = await db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Election not found' });
-  const positions = db.prepare('SELECT * FROM positions WHERE election_id=? ORDER BY sort_order, id').all(e.id);
-  const candidates = db.prepare('SELECT * FROM candidates WHERE election_id=? ORDER BY sort_order, id').all(e.id);
-  const eligCount = db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(e.id).c;
-  const elig = eligCount === 0 ? true : !!db.prepare('SELECT 1 FROM voter_eligibility WHERE election_id=? AND user_id=?').get(e.id, req.user.id);
-  const voted = !!db.prepare('SELECT 1 FROM vote_receipts WHERE election_id=? AND voter_id=?').get(e.id, req.user.id);
+  const positions = await db.prepare('SELECT * FROM positions WHERE election_id=? ORDER BY sort_order, id').all(e.id);
+  const candidates = await db.prepare('SELECT * FROM candidates WHERE election_id=? ORDER BY sort_order, id').all(e.id);
+  const eligCount = (await db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(e.id)).c;
+  const elig = eligCount === 0 ? true : !!await db.prepare('SELECT 1 FROM voter_eligibility WHERE election_id=? AND user_id=?').get(e.id, req.user.id);
+  const voted = !!await db.prepare('SELECT 1 FROM vote_receipts WHERE election_id=? AND voter_id=?').get(e.id, req.user.id);
   res.json({ election: withComputed(e), positions, candidates, eligible: elig, voted });
 });
 
 // *** SECURE VOTE SUBMISSION — server-side validation, transaction, one-vote enforcement ***
-app.post('/api/elections/:id/vote', authRequired, (req, res) => {
+app.post('/api/elections/:id/vote', authRequired, async (req, res) => {
   const electionId = Number(req.params.id);
-  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(electionId);
+  const e = await db.prepare('SELECT * FROM elections WHERE id=?').get(electionId);
   if (!e) return res.status(404).json({ error: 'Election not found' });
 
   // status check (server authoritative)
@@ -612,12 +621,12 @@ app.post('/api/elections/:id/vote', authRequired, (req, res) => {
   if (new Date(e.ends_at) < now) return res.status(403).json({ error: 'Election has closed' });
 
   // verification + eligibility
-  const me = db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
-  const reqVerify = db.prepare("SELECT value FROM settings WHERE key='require_verification_to_vote'").get();
+  const me = await db.prepare('SELECT * FROM users WHERE id=?').get(req.user.id);
+  const reqVerify = await db.prepare("SELECT value FROM settings WHERE key='require_verification_to_vote'").get();
   if (reqVerify && reqVerify.value === '1' && !me.verified) return res.status(403).json({ error: 'Account not verified. Verify before voting.' });
-  const eligCount = db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(electionId).c;
+  const eligCount = (await db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(electionId)).c;
   if (eligCount > 0) {
-    const ok = db.prepare('SELECT 1 FROM voter_eligibility WHERE election_id=? AND user_id=?').get(electionId, req.user.id);
+    const ok = await db.prepare('SELECT 1 FROM voter_eligibility WHERE election_id=? AND user_id=?').get(electionId, req.user.id);
     if (!ok) return res.status(403).json({ error: 'You are not eligible for this election' });
   }
 
@@ -625,8 +634,8 @@ app.post('/api/elections/:id/vote', authRequired, (req, res) => {
   const { selections } = req.body || {};
   if (!selections || typeof selections !== 'object') return res.status(400).json({ error: 'Invalid ballot format' });
 
-  const positions = db.prepare('SELECT * FROM positions WHERE election_id=?').all(electionId);
-  const candidates = db.prepare('SELECT * FROM candidates WHERE election_id=?').all(electionId);
+  const positions = await db.prepare('SELECT * FROM positions WHERE election_id=?').all(electionId);
+  const candidates = await db.prepare('SELECT * FROM candidates WHERE election_id=?').all(electionId);
   const candById = Object.fromEntries(candidates.map(c => [c.id, c]));
 
   // Validate each position
@@ -656,28 +665,29 @@ app.post('/api/elections/:id/vote', authRequired, (req, res) => {
   // Atomic insert with UNIQUE(election_id, voter_id) guard — prevents double vote even under race conditions.
   // Reference codes are random: on the ~1-in-16M chance of a reference_code
   // collision we regenerate and retry instead of failing the voter.
-  const tx = db.transaction((reference) => {
-    db.prepare('INSERT INTO vote_receipts(election_id, voter_id, reference_code) VALUES(?,?,?)')
+  const tx = db.transaction(async (reference) => {
+    await db.prepare('INSERT INTO vote_receipts(election_id, voter_id, reference_code) VALUES(?,?,?)')
       .run(electionId, req.user.id, reference);
     const insBallot = db.prepare('INSERT INTO ballots(election_id, position_id, candidate_id, is_abstain) VALUES(?,?,?,?)');
     for (const p of positions) {
       const arr = normalized[p.id];
-      if (arr.length === 0) insBallot.run(electionId, p.id, null, 1);
-      else for (const cid of arr) insBallot.run(electionId, p.id, cid, 0);
+      if (arr.length === 0) await insBallot.run(electionId, p.id, null, 1);
+      else for (const cid of arr) await insBallot.run(electionId, p.id, cid, 0);
     }
   });
   let reference = null;
   for (let attempt = 0; attempt < 5; attempt++) {
     reference = makeReference(electionId);
     try {
-      tx(reference);
+      await tx(reference);
       break;
     } catch (err) {
-      const msg = String(err.message || '');
-      if (msg.includes('vote_receipts.election_id') || msg.includes('election_id, vote_receipts.voter_id')) {
+      // Postgres reports a unique violation by SQLSTATE and constraint name
+      // rather than by prose, so the two outcomes are told apart structurally.
+      if (supabase.isUniqueViolation(err, 'vote_receipts_election_voter_key')) {
         return res.status(409).json({ error: 'You have already voted in this election. One student = one vote.' });
       }
-      if (msg.includes('reference_code') && attempt < 4) continue; // collision: retry with a fresh code
+      if (supabase.isUniqueViolation(err, 'reference_code') && attempt < 4) continue; // collision: retry with a fresh code
       console.error(err);
       return res.status(500).json({ error: 'Failed to record vote' });
     }
@@ -686,7 +696,7 @@ app.post('/api/elections/:id/vote', authRequired, (req, res) => {
   audit(req.user.id, 'vote.cast', `Election ${electionId} ref ${reference}`, req);
   // Confirmation deliberately contains the reference and the election only —
   // never the choices, so the receipt cannot compromise ballot secrecy.
-  notify(req.user.id, {
+  await notify(req.user.id, {
     type: 'vote.cast',
     electionId,
     title: `Vote recorded — ${e.title}`,
@@ -697,8 +707,8 @@ app.post('/api/elections/:id/vote', authRequired, (req, res) => {
   res.json({ message: 'VOTE SUCCESSFULLY CAST. Your vote has been recorded.', reference_code: reference });
 });
 
-app.get('/api/elections/:id/my-receipt', authRequired, (req, res) => {
-  const r = db.prepare('SELECT reference_code, created_at FROM vote_receipts WHERE election_id=? AND voter_id=?').get(req.params.id, req.user.id);
+app.get('/api/elections/:id/my-receipt', authRequired, async (req, res) => {
+  const r = await db.prepare('SELECT reference_code, created_at FROM vote_receipts WHERE election_id=? AND voter_id=?').get(req.params.id, req.user.id);
   if (!r) return res.status(404).json({ error: 'No vote recorded' });
   res.json(r);
 });
@@ -709,12 +719,12 @@ app.get('/api/elections/:id/my-receipt', authRequired, (req, res) => {
 //   admins_only     results are restricted to administrators entirely
 // Aggregation only: this endpoint has no code path that can return a voter's
 // individual selections, because ballots carry no voter foreign key.
-app.get('/api/elections/:id/results', authRequired, (req, res) => {
-  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id);
+app.get('/api/elections/:id/results', authRequired, async (req, res) => {
+  const e = await db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Election not found' });
   const isAdmin = ['admin', 'superadmin'].includes(req.user.role);
   if (!isAdmin) {
-    const mode = getSetting('results_visibility', 'published_only');
+    const mode = await getSetting('results_visibility', 'published_only');
     if (mode === 'admins_only') {
       return res.status(403).json({ error: 'Results are restricted to election administrators on this system' });
     }
@@ -727,62 +737,65 @@ app.get('/api/elections/:id/results', authRequired, (req, res) => {
     }
     if (Number(e.results_public) === 0) return res.status(403).json({ error: 'Results for this election are not public' });
   }
-  const r = computeResults(Number(req.params.id));
+  const r = await computeResults(Number(req.params.id));
   res.json({ ...r, election: withComputed(r.election) });
 });
 
 // ---------- ADMIN ----------
 const adminOnly = [authRequired, requireRole('admin', 'superadmin')];
 
-app.get('/api/admin/stats', adminOnly, (req, res) => {
-  const voters = db.prepare("SELECT COUNT(*) c FROM users WHERE role='voter'").get().c;
-  const elections = db.prepare('SELECT COUNT(*) c FROM elections').get().c;
-  const votes = db.prepare('SELECT COUNT(*) c FROM vote_receipts').get().c;
-  const candidates = db.prepare('SELECT COUNT(*) c FROM candidates').get().c;
+app.get('/api/admin/stats', adminOnly, async (req, res) => {
+  const voters = (await db.prepare("SELECT COUNT(*) c FROM users WHERE role='voter'").get()).c;
+  const elections = (await db.prepare('SELECT COUNT(*) c FROM elections').get()).c;
+  const votes = (await db.prepare('SELECT COUNT(*) c FROM vote_receipts').get()).c;
+  const candidates = (await db.prepare('SELECT COUNT(*) c FROM candidates').get()).c;
   const byStatus = {};
   for (const s of ['draft', 'open', 'closed', 'published']) {
-    byStatus[s] = db.prepare('SELECT COUNT(*) c FROM elections WHERE status=?').get(s).c;
+    byStatus[s] = (await db.prepare('SELECT COUNT(*) c FROM elections WHERE status=?').get(s)).c;
   }
-  const recent = db.prepare('SELECT a.*, u.email actor FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 20').all();
+  const recent = await db.prepare('SELECT a.*, u.email actor FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 20').all();
   res.json({ voters, elections, votes, candidates, byStatus, recent });
 });
 
 // Admin election list with search and status filtering.
-app.get('/api/admin/elections', adminOnly, (req, res) => {
+app.get('/api/admin/elections', adminOnly, async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 80);
   const status = String(req.query.status || '').trim();
   const where = [];
   const params = [];
-  if (q) { where.push('(title LIKE ? OR description LIKE ?)'); params.push(`%${q}%`, `%${q}%`); }
+  // ILIKE, not LIKE: SQLite's LIKE was case-insensitive for ASCII and Postgres'
+  // is not, so a plain LIKE here would silently break title search.
+  if (q) { where.push('(title ILIKE ? OR description ILIKE ?)'); params.push(`%${q}%`, `%${q}%`); }
   if (['draft', 'open', 'closed', 'published'].includes(status)) { where.push('status = ?'); params.push(status); }
   const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
-  const rows = db.prepare(`SELECT * FROM elections ${clause} ORDER BY starts_at DESC`).all(...params);
-  const out = rows.map((e) => {
-    const votes = db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(e.id).c;
-    const eligible = db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(e.id).c;
-    const positions = db.prepare('SELECT COUNT(*) c FROM positions WHERE election_id=?').get(e.id).c;
-    const candidates = db.prepare('SELECT COUNT(*) c FROM candidates WHERE election_id=?').get(e.id).c;
-    return { ...withComputed(e), votes_cast: votes, eligible_count: eligible, position_count: positions, candidate_count: candidates };
-  });
+  const rows = await db.prepare(`SELECT * FROM elections ${clause} ORDER BY starts_at DESC`).all(...params);
+  const out = [];
+  for (const e of rows) {
+    const votes = (await db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(e.id)).c;
+    const eligible = (await db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(e.id)).c;
+    const positions = (await db.prepare('SELECT COUNT(*) c FROM positions WHERE election_id=?').get(e.id)).c;
+    const candidates = (await db.prepare('SELECT COUNT(*) c FROM candidates WHERE election_id=?').get(e.id)).c;
+    out.push({ ...withComputed(e), votes_cast: votes, eligible_count: eligible, position_count: positions, candidate_count: candidates });
+  }
   res.json(out);
 });
 
 // ---------- notifications ----------
-app.get('/api/notifications', authRequired, (req, res) => {
+app.get('/api/notifications', authRequired, async (req, res) => {
   // status/sent_at are included so a client can tell a delivered notice from
   // one that was queued for email but could not be sent.
-  const rows = db.prepare(
+  const rows = await db.prepare(
     'SELECT id, election_id, type, title, body, channel, status, read_at, created_at, sent_at'
     + ' FROM notifications WHERE user_id=? ORDER BY id DESC LIMIT 50'
   ).all(req.user.id);
   res.json(rows);
 });
-app.post('/api/notifications/read', authRequired, (req, res) => {
+app.post('/api/notifications/read', authRequired, async (req, res) => {
   const ids = Array.isArray(req.body && req.body.ids) ? req.body.ids.map(Number).filter(Number.isInteger) : [];
   if (ids.length) {
     const marks = ids.map(() => '?').join(',');
     // Scoped to the caller's own rows, so one user cannot mark another's.
-    db.prepare(`UPDATE notifications SET read_at=? WHERE user_id=? AND id IN (${marks})`)
+    await db.prepare(`UPDATE notifications SET read_at=? WHERE user_id=? AND id IN (${marks})`)
       .run(new Date().toISOString(), req.user.id, ...ids);
   }
   res.json({ message: 'Marked as read' });
@@ -805,7 +818,7 @@ function assertTransition(from, to) {
   return null;
 }
 
-app.post('/api/admin/elections', adminOnly, (req, res) => {
+app.post('/api/admin/elections', adminOnly, async (req, res) => {
   const { title, description, instructions, starts_at, ends_at, status, timezone } = req.body || {};
   if (!title || !starts_at || !ends_at) return res.status(400).json({ error: 'Title, start and end dates required' });
   const start = new Date(starts_at), end = new Date(ends_at);
@@ -814,13 +827,13 @@ app.post('/api/admin/elections', adminOnly, (req, res) => {
   const tz = normaliseTimezone(timezone);
   if (!tz) return res.status(400).json({ error: 'Invalid IANA time zone (e.g. Africa/Accra)' });
   const st = ['draft', 'open', 'closed', 'published'].includes(status) ? status : 'draft';
-  const info = db.prepare('INSERT INTO elections(title,description,instructions,starts_at,ends_at,status,timezone,created_by) VALUES(?,?,?,?,?,?,?,?)')
+  const info = await db.prepare('INSERT INTO elections(title,description,instructions,starts_at,ends_at,status,timezone,created_by) VALUES(?,?,?,?,?,?,?,?) RETURNING id')
     .run(String(title).slice(0, 200), description || '', instructions || '', start.toISOString(), end.toISOString(), st, tz, req.user.id);
   audit(req.user.id, 'admin.election_create', `${title} #${info.lastInsertRowid}`, req);
   res.json({ id: info.lastInsertRowid, message: 'Election created' });
 });
-app.put('/api/admin/elections/:id', adminOnly, (req, res) => {
-  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id);
+app.put('/api/admin/elections/:id', adminOnly, async (req, res) => {
+  const e = await db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Not found' });
   const { title, description, instructions, starts_at, ends_at, timezone } = req.body || {};
   // Merge with the stored values so a partial update cannot invert the window.
@@ -832,58 +845,58 @@ app.put('/api/admin/elections/:id', adminOnly, (req, res) => {
   if (timezone !== undefined && !tz) return res.status(400).json({ error: 'Invalid IANA time zone (e.g. Africa/Accra)' });
   // The voting window is immutable once a ballot exists, otherwise a recorded
   // vote could end up outside the period it was cast in.
-  const receipts = db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(e.id).c;
+  const receipts = (await db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(e.id)).c;
   if (receipts > 0 && (newStart.getTime() !== new Date(e.starts_at).getTime() || newEnd.getTime() !== new Date(e.ends_at).getTime())) {
     return res.status(409).json({ error: `The voting window cannot be changed because ${receipts} vote(s) have already been recorded.` });
   }
-  db.prepare('UPDATE elections SET title=COALESCE(?,title), description=COALESCE(?,description), instructions=COALESCE(?,instructions), starts_at=?, ends_at=?, timezone=COALESCE(?,timezone) WHERE id=?')
+  await db.prepare('UPDATE elections SET title=COALESCE(?,title), description=COALESCE(?,description), instructions=COALESCE(?,instructions), starts_at=?, ends_at=?, timezone=COALESCE(?,timezone) WHERE id=?')
     .run(title ?? null, description ?? null, instructions ?? null,
       newStart.toISOString(), newEnd.toISOString(), tz, e.id);
   audit(req.user.id, 'admin.election_update', `#${e.id}`, req);
   res.json({ message: 'Election updated' });
 });
-app.delete('/api/admin/elections/:id', adminOnly, (req, res) => {
-  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id);
+app.delete('/api/admin/elections/:id', adminOnly, async (req, res) => {
+  const e = await db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Election not found' });
   // Deleting an election with recorded ballots would destroy the evidence of a
   // vote. Closing it is the supported path once voting has happened.
-  const receipts = db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(e.id).c;
+  const receipts = (await db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(e.id)).c;
   if (receipts > 0) {
     return res.status(409).json({ error: `This election has ${receipts} recorded vote(s) and cannot be deleted. Close it instead so the ballot record is preserved.` });
   }
-  db.prepare('DELETE FROM elections WHERE id=?').run(e.id);
+  await db.prepare('DELETE FROM elections WHERE id=?').run(e.id);
   audit(req.user.id, 'admin.election_delete', `#${e.id} (${e.title})`, req);
   res.json({ message: 'Election deleted' });
 });
-app.post('/api/admin/elections/:id/status', adminOnly, (req, res) => {
+app.post('/api/admin/elections/:id/status', adminOnly, async (req, res) => {
   const { status } = req.body || {};
   if (!['draft', 'open', 'closed', 'published'].includes(status)) return res.status(400).json({ error: 'Invalid status' });
-  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id);
+  const e = await db.prepare('SELECT * FROM elections WHERE id=?').get(req.params.id);
   if (!e) return res.status(404).json({ error: 'Election not found' });
   const problem = assertTransition(e.status, status);
   if (problem) return res.status(409).json({ error: problem });
   if (status === 'open' && new Date(e.starts_at) > new Date()) {
     return res.status(409).json({ error: 'This election cannot be opened before its start date.' });
   }
-  db.prepare('UPDATE elections SET status=? WHERE id=?').run(status, e.id);
+  await db.prepare('UPDATE elections SET status=? WHERE id=?').run(status, e.id);
   audit(req.user.id, 'admin.election_status', `#${e.id} ${e.status} -> ${status}`, req);
 
   // Lifecycle notifications for every eligible voter.
   if (status === 'open') {
-    notifyEligibleVoters(e.id, {
+    await notifyEligibleVoters(e.id, {
       type: 'election.opened',
       title: `Voting is now open — ${e.title}`,
       body: `Voting for "${e.title}" is now open and closes at ${e.ends_at}.\n\nCast your ballot: ${mailer.APP_URL}/dashboard.html`,
     });
   } else if (status === 'closed') {
-    notifyEligibleVoters(e.id, {
+    await notifyEligibleVoters(e.id, {
       type: 'election.closed',
       title: `Voting has closed — ${e.title}`,
       body: `Voting for "${e.title}" has closed. Results will be published by the Returning Officer.`,
     });
   } else if (status === 'published') {
-    db.prepare('UPDATE elections SET published_at=? WHERE id=?').run(new Date().toISOString(), e.id);
-    notifyEligibleVoters(e.id, {
+    await db.prepare('UPDATE elections SET published_at=? WHERE id=?').run(new Date().toISOString(), e.id);
+    await notifyEligibleVoters(e.id, {
       type: 'results.published',
       title: `Results published — ${e.title}`,
       body: `Results for "${e.title}" have been published.\n\nView results: ${mailer.APP_URL}/results.html?id=${e.id}`,
@@ -893,91 +906,91 @@ app.post('/api/admin/elections/:id/status', adminOnly, (req, res) => {
 });
 
 // Positions
-app.post('/api/admin/elections/:id/positions', adminOnly, (req, res) => {
+app.post('/api/admin/elections/:id/positions', adminOnly, async (req, res) => {
   const { title, description, max_select, min_select, is_mandatory, sort_order } = req.body || {};
   if (!title) return res.status(400).json({ error: 'Position title required' });
   const mx = Math.max(1, Number(max_select) || 1);
   const mn = Math.min(mx, Math.max(is_mandatory === 0 ? 0 : 1, Number(min_select ?? 1)));
-  const info = db.prepare('INSERT INTO positions(election_id,title,description,max_select,min_select,is_mandatory,sort_order) VALUES(?,?,?,?,?,?,?)')
+  const info = await db.prepare('INSERT INTO positions(election_id,title,description,max_select,min_select,is_mandatory,sort_order) VALUES(?,?,?,?,?,?,?) RETURNING id')
     .run(req.params.id, title, description||'', mx, mn, is_mandatory===0?0:1, Number(sort_order)||0);
   audit(req.user.id, 'admin.position_create', `${title} election #${req.params.id}`, req);
   res.json({ id: info.lastInsertRowid });
 });
-app.put('/api/admin/positions/:pid', adminOnly, (req, res) => {
-  const p = db.prepare('SELECT * FROM positions WHERE id=?').get(req.params.pid);
+app.put('/api/admin/positions/:pid', adminOnly, async (req, res) => {
+  const p = await db.prepare('SELECT * FROM positions WHERE id=?').get(req.params.pid);
   if (!p) return res.status(404).json({ error: 'Not found' });
   const { title, description, max_select, min_select, is_mandatory, sort_order } = req.body || {};
-  db.prepare('UPDATE positions SET title=COALESCE(?,title), description=COALESCE(?,description), max_select=COALESCE(?,max_select), min_select=COALESCE(?,min_select), is_mandatory=COALESCE(?,is_mandatory), sort_order=COALESCE(?,sort_order) WHERE id=?')
+  await db.prepare('UPDATE positions SET title=COALESCE(?,title), description=COALESCE(?,description), max_select=COALESCE(?,max_select), min_select=COALESCE(?,min_select), is_mandatory=COALESCE(?,is_mandatory), sort_order=COALESCE(?,sort_order) WHERE id=?')
     .run(title??null, description??null, max_select??null, min_select??null, is_mandatory??null, sort_order??null, p.id);
   audit(req.user.id, 'admin.position_update', `#${p.id}`, req);
   res.json({ message: 'Position updated' });
 });
-app.delete('/api/admin/positions/:pid', adminOnly, (req, res) => {
-  const p = db.prepare('SELECT * FROM positions WHERE id=?').get(req.params.pid);
+app.delete('/api/admin/positions/:pid', adminOnly, async (req, res) => {
+  const p = await db.prepare('SELECT * FROM positions WHERE id=?').get(req.params.pid);
   if (!p) return res.status(404).json({ error: 'Position not found' });
   // Removing a position cascades to its candidates, and ballots reference
   // candidates with ON DELETE SET NULL — so deleting after voting has started
   // would silently erase recorded choices. Refuse instead.
-  const votes = db.prepare('SELECT COUNT(*) c FROM ballots WHERE position_id=?').get(p.id).c;
+  const votes = (await db.prepare('SELECT COUNT(*) c FROM ballots WHERE position_id=?').get(p.id)).c;
   if (votes > 0) {
     return res.status(409).json({ error: `This position has ${votes} recorded ballot entr(ies) and cannot be deleted. Remove candidates from the ballot before closing the election instead.` });
   }
-  db.prepare('DELETE FROM positions WHERE id=?').run(p.id);
+  await db.prepare('DELETE FROM positions WHERE id=?').run(p.id);
   audit(req.user.id, 'admin.position_delete', `#${p.id} (${p.title})`, req);
   res.json({ message: 'Position deleted' });
 });
 
 // Candidates
-app.post('/api/admin/candidates', adminOnly, verifiedUpload, (req, res) => {
+app.post('/api/admin/candidates', adminOnly, verifiedUpload, async (req, res) => {
   const { election_id, position_id, name, student_id, department, faculty, level, affiliation, bio, manifesto, sort_order } = req.body || {};
   if (!election_id || !position_id || !name) return res.status(400).json({ error: 'Election, position and name required' });
-  const pos = db.prepare('SELECT * FROM positions WHERE id=? AND election_id=?').get(position_id, election_id);
+  const pos = await db.prepare('SELECT * FROM positions WHERE id=? AND election_id=?').get(position_id, election_id);
   if (!pos) return res.status(400).json({ error: 'Position does not belong to this election' });
   const photo_url = req.file ? ('/uploads/' + req.file.filename) : '';
-  const info = db.prepare('INSERT INTO candidates(election_id,position_id,name,student_id,department,faculty,level,affiliation,bio,manifesto,photo_url,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)')
+  const info = await db.prepare('INSERT INTO candidates(election_id,position_id,name,student_id,department,faculty,level,affiliation,bio,manifesto,photo_url,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id')
     .run(election_id, position_id, name, student_id||'', department||'', faculty||'', level||'', affiliation||'Independent', bio||'', manifesto||'', photo_url, Number(sort_order)||0);
   audit(req.user.id, 'admin.candidate_create', `${name} #${info.lastInsertRowid}`, req);
   res.json({ id: info.lastInsertRowid, photo_url });
 });
-app.put('/api/admin/candidates/:cid', adminOnly, verifiedUpload, (req, res) => {
-  const c = db.prepare('SELECT * FROM candidates WHERE id=?').get(req.params.cid);
+app.put('/api/admin/candidates/:cid', adminOnly, verifiedUpload, async (req, res) => {
+  const c = await db.prepare('SELECT * FROM candidates WHERE id=?').get(req.params.cid);
   if (!c) return res.status(404).json({ error: 'Not found' });
   const b = req.body || {};
   // A candidate may only be moved between positions of their own election;
   // otherwise a crafted request could attach them to an unrelated ballot.
   let positionId = c.position_id;
   if (b.position_id !== undefined && b.position_id !== null && b.position_id !== '') {
-    const target = db.prepare('SELECT id FROM positions WHERE id=? AND election_id=?').get(b.position_id, c.election_id);
+    const target = await db.prepare('SELECT id FROM positions WHERE id=? AND election_id=?').get(b.position_id, c.election_id);
     if (!target) return res.status(400).json({ error: 'Position does not belong to this election' });
     positionId = target.id;
   }
   const photo_url = req.file ? ('/uploads/' + req.file.filename) : (b.photo_url ?? c.photo_url);
-  db.prepare('UPDATE candidates SET name=COALESCE(?,name), student_id=COALESCE(?,student_id), department=COALESCE(?,department), faculty=COALESCE(?,faculty), level=COALESCE(?,level), affiliation=COALESCE(?,affiliation), bio=COALESCE(?,bio), manifesto=COALESCE(?,manifesto), photo_url=?, sort_order=COALESCE(?,sort_order), position_id=? WHERE id=?')
+  await db.prepare('UPDATE candidates SET name=COALESCE(?,name), student_id=COALESCE(?,student_id), department=COALESCE(?,department), faculty=COALESCE(?,faculty), level=COALESCE(?,level), affiliation=COALESCE(?,affiliation), bio=COALESCE(?,bio), manifesto=COALESCE(?,manifesto), photo_url=?, sort_order=COALESCE(?,sort_order), position_id=? WHERE id=?')
     .run(b.name??null, b.student_id??null, b.department??null, b.faculty??null, b.level??null, b.affiliation??null, b.bio??null, b.manifesto??null, photo_url, b.sort_order??null, positionId, c.id);
   audit(req.user.id, 'admin.candidate_update', `#${c.id} (${c.name})`, req);
   res.json({ message: 'Candidate updated', photo_url });
 });
-app.delete('/api/admin/candidates/:cid', adminOnly, (req, res) => {
-  const c = db.prepare('SELECT * FROM candidates WHERE id=?').get(req.params.cid);
+app.delete('/api/admin/candidates/:cid', adminOnly, async (req, res) => {
+  const c = await db.prepare('SELECT * FROM candidates WHERE id=?').get(req.params.cid);
   if (!c) return res.status(404).json({ error: 'Candidate not found' });
   // ballots.candidate_id is ON DELETE SET NULL, so deleting a candidate who has
   // already received votes would quietly rewrite a published result. Block it.
-  const votes = db.prepare('SELECT COUNT(*) c FROM ballots WHERE candidate_id=?').get(c.id).c;
+  const votes = (await db.prepare('SELECT COUNT(*) c FROM ballots WHERE candidate_id=?').get(c.id)).c;
   if (votes > 0) {
     return res.status(409).json({ error: `${c.name} has ${votes} recorded vote(s) and cannot be removed. Withdrawing a candidate mid-election is not permitted; publish the result with this candidate included.` });
   }
-  const receipts = db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(c.election_id).c;
+  const receipts = (await db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(c.election_id)).c;
   if (receipts > 0 && c.election_id) {
     return res.status(409).json({ error: 'Voting has already started in this election, so the candidate list is now locked.' });
   }
-  db.prepare('DELETE FROM candidates WHERE id=?').run(c.id);
+  await db.prepare('DELETE FROM candidates WHERE id=?').run(c.id);
   audit(req.user.id, 'admin.candidate_delete', `#${c.id} (${c.name})`, req);
   res.json({ message: 'Candidate deleted' });
 });
 
 // Voter roll with search + filtering. Every value is bound as a parameter and
 // the column set is fixed, so filter input can never alter the query shape.
-app.get('/api/admin/voters', adminOnly, (req, res) => {
+app.get('/api/admin/voters', adminOnly, async (req, res) => {
   const q = String(req.query.q || '').trim().slice(0, 80);
   const faculty = String(req.query.faculty || '').trim().slice(0, 80);
   const department = String(req.query.department || '').trim().slice(0, 80);
@@ -989,8 +1002,10 @@ app.get('/api/admin/voters', adminOnly, (req, res) => {
 
   const where = ["role='voter'"];
   const params = [];
+  // ILIKE, not LIKE: the roll search is over user text (name, email, student
+  // id), which SQLite matched case-insensitively and Postgres LIKE does not.
   if (q) {
-    where.push('(name LIKE ? OR email LIKE ? OR student_id LIKE ?)');
+    where.push('(name ILIKE ? OR email ILIKE ? OR student_id ILIKE ?)');
     const like = `%${q}%`;
     params.push(like, like, like);
   }
@@ -1000,34 +1015,36 @@ app.get('/api/admin/voters', adminOnly, (req, res) => {
   if (verified === '1' || verified === '0') { where.push('verified = ?'); params.push(Number(verified)); }
   if (active === '1' || active === '0') { where.push('is_active = ?'); params.push(Number(active)); }
   const clause = `WHERE ${where.join(' AND ')}`;
-  const rows = db.prepare(
+  const rows = await db.prepare(
     `SELECT id,student_id,name,email,role,faculty,department,level,verified,is_active,created_at FROM users ${clause} ORDER BY id DESC LIMIT ? OFFSET ?`
   ).all(...params, limit, offset);
-  const total = db.prepare(`SELECT COUNT(*) c FROM users ${clause}`).get(...params).c;
+  const total = (await db.prepare(`SELECT COUNT(*) c FROM users ${clause}`).get(...params)).c;
   // Distinct values power the filter dropdowns so they always reflect the roll.
   const facets = {
-    faculty: db.prepare("SELECT DISTINCT faculty v FROM users WHERE role='voter' AND faculty<>'' ORDER BY v").all().map((r) => r.v),
-    department: db.prepare("SELECT DISTINCT department v FROM users WHERE role='voter' AND department<>'' ORDER BY v").all().map((r) => r.v),
-    level: db.prepare("SELECT DISTINCT level v FROM users WHERE role='voter' AND level<>'' ORDER BY v").all().map((r) => r.v),
+    faculty: (await db.prepare("SELECT DISTINCT faculty v FROM users WHERE role='voter' AND faculty<>'' ORDER BY v").all()).map((r) => r.v),
+    department: (await db.prepare("SELECT DISTINCT department v FROM users WHERE role='voter' AND department<>'' ORDER BY v").all()).map((r) => r.v),
+    level: (await db.prepare("SELECT DISTINCT level v FROM users WHERE role='voter' AND level<>'' ORDER BY v").all()).map((r) => r.v),
   };
   res.json({ rows, total, limit, offset, facets });
 });
 
 // Candidate search scoped to one election, optionally filtered by position.
-app.get('/api/admin/elections/:id/candidates', adminOnly, (req, res) => {
+app.get('/api/admin/elections/:id/candidates', adminOnly, async (req, res) => {
   const eid = Number(req.params.id);
-  if (!db.prepare('SELECT id FROM elections WHERE id=?').get(eid)) return res.status(404).json({ error: 'Election not found' });
+  if (!await db.prepare('SELECT id FROM elections WHERE id=?').get(eid)) return res.status(404).json({ error: 'Election not found' });
   const q = String(req.query.q || '').trim().slice(0, 80);
   const positionId = String(req.query.position_id || '').trim();
   const where = ['election_id = ?'];
   const params = [eid];
+  // ILIKE, not LIKE: this searches user-entered text (candidate name, student
+  // id, department, affiliation), which SQLite matched case-insensitively.
   if (q) {
-    where.push('(name LIKE ? OR student_id LIKE ? OR department LIKE ? OR affiliation LIKE ?)');
+    where.push('(name ILIKE ? OR student_id ILIKE ? OR department ILIKE ? OR affiliation ILIKE ?)');
     const like = `%${q}%`;
     params.push(like, like, like, like);
   }
   if (positionId) { where.push('position_id = ?'); params.push(Number(positionId)); }
-  const rows = db.prepare(
+  const rows = await db.prepare(
     `SELECT * FROM candidates WHERE ${where.join(' AND ')} ORDER BY sort_order, id`
   ).all(...params);
   res.json(rows);
@@ -1035,14 +1052,14 @@ app.get('/api/admin/elections/:id/candidates', adminOnly, (req, res) => {
 // Election roll with each eligible voter's participation status.
 // Reports WHETHER a student has voted, never what they chose: the receipt
 // table holds no selections, so this endpoint cannot leak a ballot.
-app.get('/api/admin/elections/:id/roll', adminOnly, (req, res) => {
+app.get('/api/admin/elections/:id/roll', adminOnly, async (req, res) => {
   const eid = Number(req.params.id);
-  const election = db.prepare('SELECT * FROM elections WHERE id=?').get(eid);
+  const election = await db.prepare('SELECT * FROM elections WHERE id=?').get(eid);
   if (!election) return res.status(404).json({ error: 'Election not found' });
   const q = String(req.query.q || '').trim().slice(0, 80);
   const hasVoted = String(req.query.has_voted || '').trim();
 
-  const roll = db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(eid).c;
+  const roll = (await db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(eid)).c;
   // An empty eligibility table means the election is open to all voters, so the
   // roll is derived from the voter role instead. The receipt join is placed in
   // the FROM clause (before any WHERE) and yields participation only.
@@ -1053,12 +1070,14 @@ app.get('/api/admin/elections/:id/roll', adminOnly, (req, res) => {
 
   const where = [roll > 0 ? 'e.election_id = ?' : "u.role = 'voter'"];
   const params = [...fromParams, eid];
+  // ILIKE, not LIKE: the roll search covers user text (name, email, student id),
+  // which SQLite matched case-insensitively and Postgres LIKE does not.
   if (q) {
-    where.push('(u.name LIKE ? OR u.email LIKE ? OR u.student_id LIKE ?)');
+    where.push('(u.name ILIKE ? OR u.email ILIKE ? OR u.student_id ILIKE ?)');
     params.push(`%${q}%`, `%${q}%`, `%${q}%`);
   }
 
-  const rows = db.prepare(
+  const rows = await db.prepare(
     `SELECT u.id, u.student_id, u.name, u.email, u.department, u.faculty, u.level, u.verified, u.is_active,
             r.reference_code, r.created_at AS voted_at
      ${from}
@@ -1082,41 +1101,41 @@ app.get('/api/admin/elections/:id/roll', adminOnly, (req, res) => {
   });
 });
 
-app.get('/api/admin/voters/export.csv', adminOnly, (req, res) => {
+app.get('/api/admin/voters/export.csv', adminOnly, async (req, res) => {
   // Voter roll export — never includes password hashes.
-  const rows = db.prepare("SELECT student_id,name,email,faculty,department,level,verified,is_active FROM users WHERE role='voter' ORDER BY id").all();
+  const rows = await db.prepare("SELECT student_id,name,email,faculty,department,level,verified,is_active FROM users WHERE role='voter' ORDER BY id").all();
   const lines = ['student_id,name,email,faculty,department,level,verified,active'];
   for (const v of rows) lines.push([v.student_id, v.name, v.email, v.faculty, v.department, v.level, v.verified, v.is_active].map(csvCell).join(','));
   res.setHeader('Content-Type', 'text/csv');
   res.setHeader('Content-Disposition', 'attachment; filename="voter-roll.csv"');
   res.send(lines.join('\n'));
 });
-app.post('/api/admin/elections/:id/eligibility', adminOnly, (req, res) => {
+app.post('/api/admin/elections/:id/eligibility', adminOnly, async (req, res) => {
   // body: { user_ids: [...] } or { all_verified: true }
   const eid = req.params.id;
   const { user_ids, all_verified } = req.body || {};
   if (all_verified) {
-    const voters = db.prepare("SELECT id FROM users WHERE role='voter' AND is_active=1 AND verified=1").all();
-    const ins = db.prepare('INSERT OR IGNORE INTO voter_eligibility(election_id,user_id) VALUES(?,?)');
-    const tx = db.transaction(() => { for (const v of voters) ins.run(eid, v.id); });
-    tx();
+    const voters = await db.prepare("SELECT id FROM users WHERE role='voter' AND is_active=1 AND verified=1").all();
+    const ins = db.prepare('INSERT INTO voter_eligibility(election_id,user_id) VALUES(?,?) ON CONFLICT DO NOTHING');
+    const tx = db.transaction(async () => { for (const v of voters) await ins.run(eid, v.id); });
+    await tx();
     audit(req.user.id, 'admin.eligibility_bulk', `election #${eid} all verified`, req);
     return res.json({ message: `Added ${voters.length} eligible voters` });
   }
   if (!Array.isArray(user_ids)) return res.status(400).json({ error: 'user_ids array required' });
-  const ins = db.prepare('INSERT OR IGNORE INTO voter_eligibility(election_id,user_id) VALUES(?,?)');
-  const tx = db.transaction(() => { for (const uid of user_ids) ins.run(eid, Number(uid)); });
-  tx();
+  const ins = db.prepare('INSERT INTO voter_eligibility(election_id,user_id) VALUES(?,?) ON CONFLICT DO NOTHING');
+  const tx = db.transaction(async () => { for (const uid of user_ids) await ins.run(eid, Number(uid)); });
+  await tx();
   audit(req.user.id, 'admin.eligibility_add', `election #${eid} ${user_ids.length} users`, req);
   res.json({ message: 'Eligibility updated' });
 });
-app.get('/api/admin/elections/:id/eligibility', adminOnly, (req, res) => {
-  if (!db.prepare('SELECT id FROM elections WHERE id=?').get(req.params.id)) return res.status(404).json({ error: 'Election not found' });
-  const rows = db.prepare('SELECT u.id, u.student_id, u.name, u.email, u.verified FROM users u JOIN voter_eligibility e ON e.user_id=u.id WHERE e.election_id=? ORDER BY u.name').all(req.params.id);
+app.get('/api/admin/elections/:id/eligibility', adminOnly, async (req, res) => {
+  if (!await db.prepare('SELECT id FROM elections WHERE id=?').get(req.params.id)) return res.status(404).json({ error: 'Election not found' });
+  const rows = await db.prepare('SELECT u.id, u.student_id, u.name, u.email, u.verified FROM users u JOIN voter_eligibility e ON e.user_id=u.id WHERE e.election_id=? ORDER BY u.name').all(req.params.id);
   res.json({ count: rows.length, voters: rows });
 });
-app.delete('/api/admin/elections/:id/eligibility/:uid', adminOnly, (req, res) => {
-  db.prepare('DELETE FROM voter_eligibility WHERE election_id=? AND user_id=?').run(req.params.id, req.params.uid);
+app.delete('/api/admin/elections/:id/eligibility/:uid', adminOnly, async (req, res) => {
+  await db.prepare('DELETE FROM voter_eligibility WHERE election_id=? AND user_id=?').run(req.params.id, req.params.uid);
   res.json({ message: 'Removed' });
 });
 
@@ -1169,9 +1188,9 @@ app.get('/api/admin/eligibility-template', adminOnly, (req, res) => {
   res.setHeader('Content-Disposition', 'attachment; filename="eligibility-template.csv"');
   res.send('student_id,email\nUEN0012023,student@university.edu\n');
 });
-app.post('/api/admin/elections/:id/eligibility/import', adminOnly, csvUpload.single('file'), (req, res) => {
+app.post('/api/admin/elections/:id/eligibility/import', adminOnly, csvUpload.single('file'), async (req, res) => {
   const eid = Number(req.params.id);
-  if (!db.prepare('SELECT id FROM elections WHERE id=?').get(eid)) return res.status(404).json({ error: 'Election not found' });
+  if (!await db.prepare('SELECT id FROM elections WHERE id=?').get(eid)) return res.status(404).json({ error: 'Election not found' });
   if (!req.file) return res.status(400).json({ error: 'CSV file required (field name: file)' });
   let rows;
   try { rows = parseCsv(req.file.buffer.toString('utf8')); }
@@ -1182,42 +1201,42 @@ app.post('/api/admin/elections/:id/eligibility/import', adminOnly, csvUpload.sin
 
   const bySid = db.prepare("SELECT id FROM users WHERE role='voter' AND student_id=?");
   const byEmail = db.prepare("SELECT id FROM users WHERE role='voter' AND email=?");
-  const ins = db.prepare('INSERT OR IGNORE INTO voter_eligibility(election_id,user_id) VALUES(?,?)');
+  const ins = db.prepare('INSERT INTO voter_eligibility(election_id,user_id) VALUES(?,?) ON CONFLICT DO NOTHING');
   let added = 0, already = 0;
   const notFound = [];
-  const tx = db.transaction(() => {
+  const tx = db.transaction(async () => {
     for (const r of rows) {
       let user;
-      if (hasSid && r.student_id) user = bySid.get(r.student_id.toUpperCase());
-      if (!user && hasEmail && r.email) user = byEmail.get(r.email.toLowerCase());
+      if (hasSid && r.student_id) user = await bySid.get(r.student_id.toUpperCase());
+      if (!user && hasEmail && r.email) user = await byEmail.get(r.email.toLowerCase());
       if (!user) { notFound.push(r.student_id || r.email || '(blank row)'); continue; }
-      const info = ins.run(eid, user.id);
+      const info = await ins.run(eid, user.id);
       if (info.changes > 0) added++; else already++;
     }
   });
-  tx();
+  await tx();
   audit(req.user.id, 'admin.eligibility_import', `election #${eid}: +${added}, already ${already}, missing ${notFound.length}`, req);
   res.json({ added, already, not_found: notFound.slice(0, 50), not_found_total: notFound.length, message: `Import complete: ${added} added, ${already} already eligible, ${notFound.length} not found.` });
 });
 
 // Aggregate results as CSV (admins only; never includes voter identities).
 // Shared computation with the JSON results endpoint.
-function computeResults(electionId) {
-  const e = db.prepare('SELECT * FROM elections WHERE id=?').get(electionId);
+async function computeResults(electionId) {
+  const e = await db.prepare('SELECT * FROM elections WHERE id=?').get(electionId);
   if (!e) return null;
-  const positions = db.prepare('SELECT * FROM positions WHERE election_id=? ORDER BY sort_order,id').all(electionId);
-  const candidates = db.prepare('SELECT * FROM candidates WHERE election_id=? ORDER BY sort_order,id').all(electionId);
-  let eligibleTotal = db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(electionId).c;
-  if (eligibleTotal === 0) eligibleTotal = db.prepare("SELECT COUNT(*) c FROM users WHERE role='voter' AND is_active=1").get().c;
-  const votesCast = db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(electionId).c;
+  const positions = await db.prepare('SELECT * FROM positions WHERE election_id=? ORDER BY sort_order,id').all(electionId);
+  const candidates = await db.prepare('SELECT * FROM candidates WHERE election_id=? ORDER BY sort_order,id').all(electionId);
+  let eligibleTotal = (await db.prepare('SELECT COUNT(*) c FROM voter_eligibility WHERE election_id=?').get(electionId)).c;
+  if (eligibleTotal === 0) eligibleTotal = (await db.prepare("SELECT COUNT(*) c FROM users WHERE role='voter' AND is_active=1").get()).c;
+  const votesCast = (await db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(electionId)).c;
   const perCandidate = {};
-  for (const c of candidates) perCandidate[c.id] = db.prepare('SELECT COUNT(*) c FROM ballots WHERE election_id=? AND candidate_id=?').get(electionId, c.id).c;
+  for (const c of candidates) perCandidate[c.id] = (await db.prepare('SELECT COUNT(*) c FROM ballots WHERE election_id=? AND candidate_id=?').get(electionId, c.id)).c;
   const perPosition = {};
   for (const p of positions) {
-    const positionVotes = db.prepare('SELECT COUNT(*) c FROM ballots WHERE election_id=? AND position_id=? AND is_abstain=0').get(electionId, p.id).c;
+    const positionVotes = (await db.prepare('SELECT COUNT(*) c FROM ballots WHERE election_id=? AND position_id=? AND is_abstain=0').get(electionId, p.id)).c;
     perPosition[p.id] = {
       votes: positionVotes,
-      abstentions: db.prepare('SELECT COUNT(*) c FROM ballots WHERE election_id=? AND position_id=? AND is_abstain=1').get(electionId, p.id).c,
+      abstentions: (await db.prepare('SELECT COUNT(*) c FROM ballots WHERE election_id=? AND position_id=? AND is_abstain=1').get(electionId, p.id)).c,
     };
     // Leading candidate(s). Reported as aggregate tallies only.
     const inPosition = candidates.filter((c) => c.position_id === p.id);
@@ -1228,8 +1247,8 @@ function computeResults(electionId) {
   }
   return { election: e, positions, candidates, perCandidate, perPosition, eligibleTotal, votesCast, turnout: eligibleTotal ? +(votesCast * 100 / eligibleTotal).toFixed(2) : 0 };
 }
-app.get('/api/admin/elections/:id/results.csv', adminOnly, (req, res) => {
-  const r = computeResults(Number(req.params.id));
+app.get('/api/admin/elections/:id/results.csv', adminOnly, async (req, res) => {
+  const r = await computeResults(Number(req.params.id));
   if (!r) return res.status(404).json({ error: 'Election not found' });
   const lines = ['position,candidate,department,affiliation,votes,percent_of_position'];
   for (const p of r.positions) {
@@ -1246,34 +1265,37 @@ app.get('/api/admin/elections/:id/results.csv', adminOnly, (req, res) => {
   res.setHeader('Content-Disposition', `attachment; filename="results-election-${req.params.id}.csv"`);
   res.send(lines.join('\n'));
 });
-app.get('/api/admin/elections/:id/activity', adminOnly, (req, res) => {
+app.get('/api/admin/elections/:id/activity', adminOnly, async (req, res) => {
   // Aggregate activity only — never expose who voted for whom
   const eid = req.params.id;
-  const receipts = db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(eid).c;
-  const byHour = db.prepare("SELECT strftime('%Y-%m-%d %H:00', created_at) h, COUNT(*) c FROM vote_receipts WHERE election_id=? GROUP BY h ORDER BY h").all(eid);
-  const logs = db.prepare('SELECT a.*, u.email actor FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 50').all();
+  const receipts = (await db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE election_id=?').get(eid)).c;
+  // to_char(... AT TIME ZONE 'UTC', ...) is the Postgres equivalent of the old
+  // SQLite hour-bucketing format: created_at is a timestamptz, so it is bucketed
+  // to the hour in UTC to keep the 'YYYY-MM-DD HH:00' label the chart expects.
+  const byHour = await db.prepare("SELECT to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:00') h, COUNT(*) c FROM vote_receipts WHERE election_id=? GROUP BY h ORDER BY h").all(eid);
+  const logs = await db.prepare('SELECT a.*, u.email actor FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 50').all();
   res.json({ receipts, byHour, logs });
 });
 
 // ---------- SUPERADMIN ----------
 const superOnly = [authRequired, requireRole('superadmin')];
-app.get('/api/super/users', superOnly, (req, res) => {
-  res.json(db.prepare('SELECT id,student_id,name,email,role,faculty,department,level,verified,is_active,created_at FROM users ORDER BY id DESC LIMIT 500').all());
+app.get('/api/super/users', superOnly, async (req, res) => {
+  res.json(await db.prepare('SELECT id,student_id,name,email,role,faculty,department,level,verified,is_active,created_at FROM users ORDER BY id DESC LIMIT 500').all());
 });
-app.post('/api/super/users', superOnly, (req, res) => {
+app.post('/api/super/users', superOnly, async (req, res) => {
   let { name, student_id, email, password, role, faculty, department, level } = req.body || {};
   if (!name || !email || !password) return res.status(400).json({ error: 'Name, email, password required' });
   if (!['voter','admin','superadmin'].includes(role)) role = 'voter';
   const hash = bcrypt.hashSync(password, 12);
   try {
-    const info = db.prepare('INSERT INTO users(name,student_id,email,password_hash,role,faculty,department,level,verified) VALUES(?,?,?,?,?,?,?,?,1)')
+    const info = await db.prepare('INSERT INTO users(name,student_id,email,password_hash,role,faculty,department,level,verified) VALUES(?,?,?,?,?,?,?,?,1) RETURNING id')
       .run(name, (student_id||'').toUpperCase()||null, email.toLowerCase(), hash, role, faculty||'', department||'', level||'');
     audit(req.user.id, 'super.user_create', `${email} as ${role}`, req);
     res.json({ id: info.lastInsertRowid });
   } catch (e) { res.status(409).json({ error: 'Email or Student ID already exists' }); }
 });
-app.put('/api/super/users/:id', superOnly, (req, res) => {
-  const u = db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
+app.put('/api/super/users/:id', superOnly, async (req, res) => {
+  const u = await db.prepare('SELECT * FROM users WHERE id=?').get(req.params.id);
   if (!u) return res.status(404).json({ error: 'Not found' });
   const { name, role, is_active, verified, faculty, department, level, password } = req.body || {};
   if (role && !['voter','admin','superadmin'].includes(role)) return res.status(400).json({ error: 'Invalid role' });
@@ -1281,54 +1303,54 @@ app.put('/api/super/users/:id', superOnly, (req, res) => {
   // active super admin can neither be demoted nor deactivated.
   const losingSuper = (role && role !== 'superadmin') || (is_active !== undefined && Number(is_active) === 0);
   if (u.role === 'superadmin' && losingSuper) {
-    const others = db.prepare("SELECT COUNT(*) c FROM users WHERE role='superadmin' AND is_active=1 AND id<>?").get(u.id).c;
+    const others = (await db.prepare("SELECT COUNT(*) c FROM users WHERE role='superadmin' AND is_active=1 AND id<>?").get(u.id)).c;
     if (others === 0) {
       return res.status(409).json({ error: 'This is the last active super admin. Promote another super admin before changing this account.' });
     }
   }
-  db.prepare('UPDATE users SET name=COALESCE(?,name), role=COALESCE(?,role), is_active=COALESCE(?,is_active), verified=COALESCE(?,verified), faculty=COALESCE(?,faculty), department=COALESCE(?,department), level=COALESCE(?,level) WHERE id=?')
+  await db.prepare('UPDATE users SET name=COALESCE(?,name), role=COALESCE(?,role), is_active=COALESCE(?,is_active), verified=COALESCE(?,verified), faculty=COALESCE(?,faculty), department=COALESCE(?,department), level=COALESCE(?,level) WHERE id=?')
     .run(name??null, role??null, is_active??null, verified??null, faculty??null, department??null, level??null, u.id);
   if (password) {
     if (String(password).length < 8) return res.status(400).json({ error: 'Password must be at least 8 characters' });
-    db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(password,12), u.id);
+    await db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(bcrypt.hashSync(password,12), u.id);
   }
   audit(req.user.id, 'super.user_update', `#${u.id}`, req);
   res.json({ message: 'User updated' });
 });
-app.delete('/api/super/users/:id', superOnly, (req, res) => {
+app.delete('/api/super/users/:id', superOnly, async (req, res) => {
   if (Number(req.params.id) === req.user.id) return res.status(400).json({ error: 'Cannot delete yourself' });
-  const target = db.prepare('SELECT id, role, name FROM users WHERE id=?').get(req.params.id);
+  const target = await db.prepare('SELECT id, role, name FROM users WHERE id=?').get(req.params.id);
   if (!target) return res.status(404).json({ error: 'Not found' });
   if (target.role === 'superadmin') {
-    const others = db.prepare("SELECT COUNT(*) c FROM users WHERE role='superadmin' AND id<>?").get(target.id).c;
+    const others = (await db.prepare("SELECT COUNT(*) c FROM users WHERE role='superadmin' AND id<>?").get(target.id)).c;
     if (others === 0) return res.status(409).json({ error: 'Cannot delete the last super admin' });
   }
   // Deleting a voter would cascade away their vote receipts. Their ballots are
   // already anonymous, so deactivating the account is the safe alternative.
-  const receipts = db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE voter_id=?').get(target.id).c;
+  const receipts = (await db.prepare('SELECT COUNT(*) c FROM vote_receipts WHERE voter_id=?').get(target.id)).c;
   if (receipts > 0) {
     return res.status(409).json({ error: `${target.name} has ${receipts} recorded vote(s) and cannot be deleted. Deactivate the account instead.` });
   }
-  db.prepare('DELETE FROM users WHERE id=?').run(req.params.id);
+  await db.prepare('DELETE FROM users WHERE id=?').run(req.params.id);
   audit(req.user.id, 'super.user_delete', `#${req.params.id} (${target.name})`, req);
   res.json({ message: 'User deleted' });
 });
-app.get('/api/super/logs', superOnly, (req, res) => {
-  res.json(db.prepare('SELECT a.*, u.email actor FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 200').all());
+app.get('/api/super/logs', superOnly, async (req, res) => {
+  res.json(await db.prepare('SELECT a.*, u.email actor FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_id ORDER BY a.id DESC LIMIT 200').all());
 });
-app.get('/api/super/settings', superOnly, (req, res) => {
-  res.json(db.prepare('SELECT * FROM settings').all());
+app.get('/api/super/settings', superOnly, async (req, res) => {
+  res.json(await db.prepare('SELECT * FROM settings').all());
 });
-app.put('/api/super/settings', superOnly, (req, res) => {
+app.put('/api/super/settings', superOnly, async (req, res) => {
   const { key, value } = req.body || {};
   if (!key) return res.status(400).json({ error: 'key required' });
-  db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, String(value));
+  await db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value').run(key, String(value));
   audit(req.user.id, 'super.settings', `${key}=${value}`, req);
   res.json({ message: 'Setting saved' });
 });
 // Bootstrap first superadmin (protected by setup key, only if none exists)
-app.post('/api/setup/superadmin', (req, res) => {
-  const count = db.prepare("SELECT COUNT(*) c FROM users WHERE role='superadmin'").get().c;
+app.post('/api/setup/superadmin', async (req, res) => {
+  const count = (await db.prepare("SELECT COUNT(*) c FROM users WHERE role='superadmin'").get()).c;
   if (count > 0) return res.status(403).json({ error: 'Super admin already exists. Ask an existing super admin.' });
   if (!ADMIN_SETUP_KEY) {
     return res.status(503).json({ error: 'Super admin bootstrap is disabled because ADMIN_SETUP_KEY is not configured on the server.' });
@@ -1341,7 +1363,7 @@ app.post('/api/setup/superadmin', (req, res) => {
     return res.status(403).json({ error: 'Invalid setup key' });
   }
   if (!name || !email || !password) return res.status(400).json({ error: 'Name, email, password required' });
-  const info = db.prepare("INSERT INTO users(name,student_id,email,password_hash,role,verified) VALUES(?,?,?,?,?,1)")
+  const info = await db.prepare("INSERT INTO users(name,student_id,email,password_hash,role,verified) VALUES(?,?,?,?,?,1) RETURNING id")
     .run(name, (student_id||'SUPERADMIN').toUpperCase(), email.toLowerCase(), bcrypt.hashSync(password,12), 'superadmin');
   audit(info.lastInsertRowid, 'setup.superadmin', email, req);
   res.json({ message: 'Super admin created. Please log in.' });
@@ -1365,15 +1387,16 @@ app.get('*', (req, res, next) => {
 // Background job: auto-close elections whose end date has passed.
 // Interval configurable via SCHEDULER_MS (default 60s; tests use ~1s).
 const SCHEDULER_MS = Number(process.env.SCHEDULER_MS || 60000);
-setInterval(() => {
+setInterval(async () => {
   try {
-    // Compared in JS because ends_at is stored as ISO-8601 (with 'T'),
-    // which does not sort against SQLite's datetime('now') strings.
+    // Compared in JS so the whole batch shares a single `now` and ends_at (a
+    // timestamptz, read back as ISO-8601) is evaluated against the server clock
+    // rather than folded into SQL string ordering.
     const now = Date.now();
-    const open = db.prepare("SELECT id, title, ends_at FROM elections WHERE status='open'").all();
+    const open = await db.prepare("SELECT id, title, ends_at FROM elections WHERE status='open'").all();
     for (const e of open) {
       if (new Date(e.ends_at).getTime() > now) continue;
-      db.prepare("UPDATE elections SET status='closed' WHERE id=? AND status='open'").run(e.id);
+      await db.prepare("UPDATE elections SET status='closed' WHERE id=? AND status='open'").run(e.id);
       audit(null, 'system.auto_close', `Election #${e.id} (${e.title}) closed automatically`, null);
       console.log(`[scheduler] auto-closed election #${e.id}`);
     }

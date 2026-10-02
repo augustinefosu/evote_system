@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login — University E-Voting</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<header class="topbar">
+  <div class="brand"><div class="crest" aria-hidden="true">UE</div><div>UNIVERSITY E-VOTING SYSTEM</div></div>
+  <nav class="nav" id="nav" aria-label="Main"></nav>
+</header>
+
+<main class="container" id="main">
+  <form class="card auth" id="login-form" novalidate>
+    <h2>Student / Staff Login</h2>
+    <p class="meta">Use your Student ID or email address and your password.</p>
+    <div id="msg" style="display:none"></div>
+    <div class="field">
+      <label for="identifier">Student ID or email</label>
+      <input id="identifier" name="identifier" required autocomplete="username"
+        placeholder="e.g. UEN0012023 or you@student.university.edu">
+    </div>
+    <div class="field">
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" required autocomplete="current-password">
+    </div>
+    <button type="submit" class="btn" style="width:100%">Login</button>
+    <p class="meta" style="margin-bottom:0">
+      <a href="/forgot.html">Forgot password?</a> ·
+      <a href="/register.html">Create account</a> ·
+      <a href="/verify.html">Verify account</a>
+    </p>
+  </form>
+</main>
+
+<script src="/js/api.js"></script>
+<script src="/js/pages/login.js"></script>
+</body>
+</html>

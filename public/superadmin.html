@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Super Administration — University E-Voting</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<header class="topbar">
+  <div class="brand"><div class="crest" aria-hidden="true">UE</div><div>SUPER ADMINISTRATION</div></div>
+  <nav class="nav" id="nav" aria-label="Main"></nav>
+</header>
+
+<main class="container" id="main">
+  <div class="grid four" id="super-kpis"></div>
+  <div id="super-admins" style="margin-top:14px"></div>
+
+  <div class="tabs" style="margin-top:14px" role="tablist" aria-label="System administration sections">
+    <button type="button" role="tab" data-tab="admins" id="tab-admins" aria-controls="pane-admins" aria-selected="true" class="active">Administrators</button>
+    <button type="button" role="tab" data-tab="users" id="tab-users" aria-controls="pane-users" aria-selected="false" tabindex="-1">User Register</button>
+    <button type="button" role="tab" data-tab="settings" id="tab-settings" aria-controls="pane-settings" aria-selected="false" tabindex="-1">Settings</button>
+    <button type="button" role="tab" data-tab="audit" id="tab-audit" aria-controls="pane-audit" aria-selected="false" tabindex="-1">Audit Trail</button>
+  </div>
+
+  <div id="super-message" style="margin-top:12px"></div>
+
+  <div id="pane-admins" class="card" role="tabpanel" aria-labelledby="tab-admins"></div>
+  <div id="pane-users" class="card hidden" role="tabpanel" aria-labelledby="tab-users"></div>
+  <div id="pane-settings" class="card hidden" role="tabpanel" aria-labelledby="tab-settings"></div>
+  <div id="pane-audit" class="card hidden" role="tabpanel" aria-labelledby="tab-audit"></div>
+</main>
+
+<script src="/js/api.js"></script>
+<script src="/js/pages/superadmin.js"></script>
+</body>
+</html>

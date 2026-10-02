@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Verify / Password — University E-Voting</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<header class="topbar">
+  <div class="brand"><div class="crest" aria-hidden="true">UE</div><div>UNIVERSITY E-VOTING SYSTEM</div></div>
+  <nav class="nav" aria-label="Main"><a href="/login.html">Login</a></nav>
+</header>
+
+<main class="container grid two" id="main">
+  <form class="card" id="verify-form" novalidate>
+    <h3>Verify Account</h3>
+    <div id="verify-msg" style="display:none"></div>
+    <div class="field">
+      <label for="token">Verification token</label>
+      <input id="token" name="token" autocomplete="one-time-code" spellcheck="false">
+      <p class="hint">Paste the token from your verification email, or use the link in that email.</p>
+    </div>
+    <button type="submit" class="btn small">Verify</button>
+  </form>
+
+  <form class="card" id="forgot-form" novalidate>
+    <h3>Forgot Password</h3>
+    <div id="forgot-msg" style="display:none"></div>
+    <div class="field">
+      <label for="email">Email address</label>
+      <input id="email" name="email" type="email" required autocomplete="email">
+    </div>
+    <button type="submit" class="btn small">Send reset token</button>
+  </form>
+
+  <form class="card" id="reset-form" novalidate>
+    <h3>Reset Password</h3>
+    <div id="reset-msg" style="display:none"></div>
+    <div class="field">
+      <label for="reset-token">Reset token</label>
+      <input id="reset-token" name="reset_token" autocomplete="one-time-code" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="new-password">New password</label>
+      <input id="new-password" name="new_password" type="password" required minlength="8" autocomplete="new-password"
+        aria-describedby="new-password-hint">
+      <p class="hint" id="new-password-hint">At least 8 characters.</p>
+    </div>
+    <button type="submit" class="btn small">Reset password</button>
+  </form>
+</main>
+
+<script src="/js/api.js"></script>
+<script src="/js/pages/verify.js"></script>
+</body>
+</html>

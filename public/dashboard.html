@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Dashboard — University E-Voting</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<header class="topbar">
+  <div class="brand"><div class="crest" aria-hidden="true">UE</div><div>UNIVERSITY E-VOTING SYSTEM</div></div>
+  <nav class="nav" id="nav" aria-label="Main"></nav>
+</header>
+
+<main class="container" id="main">
+  <div class="card" id="who"><h2>Loading your details…</h2></div>
+
+  <div id="notices" aria-live="polite"></div>
+
+  <h3>Available Elections</h3>
+  <div class="grid" id="election-list"></div>
+
+  <div class="card" style="margin-top:16px">
+    <h3>Voting Instructions</h3>
+    <ol class="meta">
+      <li>Only verified &amp; eligible students may vote.</li>
+      <li>One Student = One Vote per election — enforced on the server.</li>
+      <li>Review your ballot before final submission.</li>
+      <li>Keep your confirmation reference (EVS-…).</li>
+      <li>Your choices are secret and never shown after submission.</li>
+    </ol>
+  </div>
+
+  <div class="card" style="margin-top:16px">
+    <h3>Account Settings</h3>
+    <div id="password-msg" style="display:none"></div>
+    <form id="password-form" novalidate>
+      <div class="grid two">
+        <div class="field">
+          <label for="current-password">Current password</label>
+          <input id="current-password" name="current_password" type="password" required autocomplete="current-password">
+        </div>
+        <div class="field">
+          <label for="new-password">New password</label>
+          <input id="new-password" name="new_password" type="password" required minlength="8" autocomplete="new-password"
+            aria-describedby="new-password-hint">
+          <p class="hint" id="new-password-hint">At least 8 characters.</p>
+        </div>
+      </div>
+      <button type="submit" class="btn small">Change password</button>
+    </form>
+  </div>
+</main>
+
+<script src="/js/api.js"></script>
+<script src="/js/pages/dashboard.js"></script>
+</body>
+</html>

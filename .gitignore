@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Secrets — never commit. .env holds JWT_SECRET, ADMIN_SETUP_KEY and the Supabase
+# service role key (which bypasses Row Level Security). .env.local holds machine
+# specific overrides. .env.example is the placeholder template and IS tracked.
+.env
+.env.local
+.env.*.local
+
+# Local SQLite database and its WAL sidecars. The Supabase database is remote;
+# these are the local dev copy and must not be committed.
+evoting.db
+evoting.db-shm
+evoting.db-wal
+
+# Runtime directories
+uploads/*
+!uploads/.gitkeep
+backups/
+
+# Logs
+npm-debug.log*
+*.log
+
+# OS / editor cruft
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

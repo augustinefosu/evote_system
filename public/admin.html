@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Elections — University E-Voting</title>
+<link rel="stylesheet" href="/css/style.css">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to main content</a>
+
+<header class="topbar">
+  <div class="brand"><div class="crest" aria-hidden="true">UE</div><div>ELECTION ADMINISTRATION</div></div>
+  <nav class="nav" id="nav" aria-label="Main"></nav>
+</header>
+
+<main class="container" id="main">
+  <div class="grid four" id="kpis"></div>
+
+  <div class="tabs" style="margin-top:14px" role="tablist" aria-label="Administration sections">
+    <button type="button" role="tab" data-tab="elections" id="tab-elections" aria-controls="pane-elections" aria-selected="true" class="active">Elections</button>
+    <button type="button" role="tab" data-tab="positions" id="tab-positions" aria-controls="pane-positions" aria-selected="false" tabindex="-1">Positions &amp; Candidates</button>
+    <button type="button" role="tab" data-tab="voters" id="tab-voters" aria-controls="pane-voters" aria-selected="false" tabindex="-1">Voters &amp; Eligibility</button>
+    <button type="button" role="tab" data-tab="activity" id="tab-activity" aria-controls="pane-activity" aria-selected="false" tabindex="-1">Activity</button>
+  </div>
+
+  <div id="admin-message" style="margin-top:12px"></div>
+
+  <div id="pane-elections" class="card" role="tabpanel" aria-labelledby="tab-elections"></div>
+  <div id="pane-positions" class="card hidden" role="tabpanel" aria-labelledby="tab-positions"></div>
+  <div id="pane-voters" class="card hidden" role="tabpanel" aria-labelledby="tab-voters"></div>
+  <div id="pane-activity" class="card hidden" role="tabpanel" aria-labelledby="tab-activity"></div>
+</main>
+
+<script src="/js/api.js"></script>
+<script src="/js/pages/admin.js"></script>
+</body>
+</html>

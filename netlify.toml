@@ -1,0 +1,17 @@
+# Netlify is used here ONLY as a static preview of the frontend.
+#
+# This project is an Express app: the API, authentication and voting run in
+# src/server.js, which Netlify cannot execute. Login, voting and every /api/...
+# call will still return 404 on this deploy. The working app runs on Render
+# (see render.yaml and the README).
+#
+# What this file does:
+#   * overrides the Netlify UI build command, so the missing `npm run build`
+#     script no longer fails the build;
+#   * publishes public/ at the site root, so the pages load at "/" and the
+#     repository source (server code, tests, schema) is no longer downloadable.
+#
+# The [build] settings in netlify.toml take precedence over the Netlify UI.
+[build]
+  command = "echo 'Static preview only - the API runs on Render'"
+  publish = "public"

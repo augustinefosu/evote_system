@@ -174,15 +174,36 @@ instead of silently testing it.
 
 ## Deployment
 
-Supabase runs the database and authentication. It does not run the Express API, so that process
-still needs a host of its own — any Node host that can reach Supabase over the network and forward
-a port (Railway, Render, Fly.io, a VM behind Caddy/Nginx, or `node src/server.js` on a machine).
-There is no container definition in this repository; run the app directly or add a host-specific
-one.
+Supabase runs the database, authentication and object storage. The Express API runs either as a
+long-lived Node process (Render, Railway, Fly.io, a VM, or `node src/server.js`) or as a Netlify
+Function. Either way the frontend calls `/api/...` same-origin (`public/js/api.js`), so the API and
+the static pages must be reachable from one origin.
 
-> **Not a static site.** Netlify, GitHub Pages and similar static-only hosts cannot run this app.
-> The API, authentication and voting execute inside `src/server.js`, and the frontend calls
-> `/api/...` same-origin (`public/js/api.js`), so the API and pages must be served from one origin.
+> **Not a static site.** A static-only host cannot run this app. Netlify works because it supports
+> serverless Functions: `src/server.js` is wrapped by `netlify/functions/api.js`, and
+> `netlify.toml` rewrites `/api/*` to it. GitHub Pages and other pure-static hosts cannot.
+
+### Netlify (Functions)
+
+`netlify.toml` builds the static pages from `public/` and bundles the Express app into one
+function. Candidate photos go to Supabase Storage because the function filesystem is read-only and
+ephemeral.
+
+1. Supabase Dashboard → Storage → **New bucket** → `candidate-photos` → mark it **public**.
+2. Site configuration → **Environment variables** → add `SUPABASE_URL`,
+   `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL`, `SUPABASE_STORAGE_BUCKET=candidate-photos`,
+   `ADMIN_SETUP_KEY` and a strong `JWT_SECRET`. Set `SUPABASE_DB_SSL=no-verify` only if the
+   deployment cannot verify Supabase's certificate (pin the CA and use `true` for production).
+3. Connect the repo and deploy. `netlify/functions/api.js` serves `/api/*`; the scheduled
+   `netlify/functions/scheduler.js` closes elections whose end time has passed (every 5 minutes).
+4. Apply `supabase/schema.sql` once from a machine (`npm run db:migrate`) before the first request —
+   function invocations are far too short-lived to run migrations.
+5. Call `POST /api/setup/superadmin` with `ADMIN_SETUP_KEY` to create the first administrator, then
+   delete that variable.
+
+Function invocations are short-lived and may cold-start; the app does its auth checks per request,
+and the scheduled function replaces the in-process `SCHEDULER_MS` interval, which does not exist on
+serverless.
 
 ### Render
 
@@ -237,6 +258,9 @@ brew install libpq
       Supabase's certificate not being in the local CA bundle; keep it strictly `true` on the host.
 - [ ] Service role key supplied through the host's secret store only, never in a committed file and
       never in the browser. It bypasses Row Level Security entirely.
+- [ ] On serverless (Netlify): a **public** `candidate-photos` bucket and `SUPABASE_STORAGE_BUCKET`
+      set, since the function disk is read-only; apply `supabase/schema.sql` before the first
+      request.
 - [ ] Strong random `JWT_SECRET` and a fresh `ADMIN_SETUP_KEY`, then delete the setup key once the
       first super-administrator exists (the server refuses to start on a placeholder secret).
 - [ ] SMTP configured via `SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASS` + `MAIL_FROM`. When set,

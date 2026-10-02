@@ -13,6 +13,7 @@
 // receives no database credentials at all — every query goes through the API.
 const { Pool, types } = require('pg');
 const { createClient } = require('@supabase/supabase-js');
+const crypto = require('crypto');
 
 // Postgres and SQLite disagree on two types the existing code depends on.
 // Postgres hands back bigint as a string and timestamps as Date objects, while
@@ -132,11 +133,11 @@ async function transaction(fn) {
 
 let authClient = null;
 
-function auth() {
+function serviceClient() {
   if (authClient) return authClient;
   if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
     throw new Error(
-      'Supabase Auth is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env.'
+      'Supabase is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env.'
     );
   }
   authClient = createClient(SUPABASE_URL, SERVICE_ROLE_KEY, {
@@ -149,6 +150,46 @@ function auth() {
     },
   });
   return authClient;
+}
+
+function auth() {
+  if (!SUPABASE_URL || !SERVICE_ROLE_KEY) {
+    throw new Error(
+      'Supabase Auth is not configured. Set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in .env.'
+    );
+  }
+  return serviceClient();
+}
+
+/* ------------------------------------------------------------------ *
+ * Supabase Storage — candidate photos.
+ *
+ * Netlify Functions have an ephemeral, read-only disk, so uploaded photos
+ * cannot live on the function filesystem. When Storage is configured they are
+ * written to a public bucket and referenced by their public URL; otherwise the
+ * caller falls back to local disk (development and the test suites).
+ * ------------------------------------------------------------------ */
+const STORAGE_BUCKET = (process.env.SUPABASE_STORAGE_BUCKET || '').trim();
+
+// Storage is opt-in: it requires an explicit bucket name as well as the
+// Supabase URL and key. Without it the caller falls back to local disk, which
+// keeps tests and local development off the network (and off production).
+function isStorageConfigured() {
+  return Boolean(SUPABASE_URL && SERVICE_ROLE_KEY && STORAGE_BUCKET);
+}
+
+// buffer is the already-sniffed image; contentType is the verified MIME type.
+async function uploadCandidatePhoto(buffer, ext, contentType) {
+  const name = 'candidate-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex') + ext;
+  const client = serviceClient();
+  const { error } = await client.storage.from(STORAGE_BUCKET).upload(name, buffer, {
+    contentType,
+    cacheControl: '31536000',
+    upsert: false,
+  });
+  if (error) throw new Error('Photo upload failed: ' + error.message);
+  const { data } = client.storage.from(STORAGE_BUCKET).getPublicUrl(name);
+  return data.publicUrl;
 }
 
 // Verifies a browser-supplied access token and resolves it to an auth.users
@@ -196,6 +237,8 @@ module.exports = {
   getPool,
   isConfigured,
   isAuthConfigured,
+  isStorageConfigured,
+  uploadCandidatePhoto,
   query,
   rows,
   row,

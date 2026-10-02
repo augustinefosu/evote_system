@@ -19,6 +19,9 @@ uploads/*
 !uploads/.gitkeep
 backups/
 
+# Netlify build output (bundled functions, cache)
+.netlify/
+
 # Logs
 npm-debug.log*
 *.log

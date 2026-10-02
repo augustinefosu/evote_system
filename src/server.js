@@ -24,6 +24,25 @@ const supabase = require('./supabase');
 const app = express();
 const PORT = process.env.PORT || 3000;
 const IS_PROD = process.env.NODE_ENV === 'production';
+// Netlify Function (and Lambda) entry points set APP_RUNTIME=function before
+// requiring this module. A config error there must fail the request instead of
+// killing a warm container with process.exit().
+const IN_FUNCTION = process.env.APP_RUNTIME === 'function';
+// Every supported host (Netlify Functions, Render, Nginx) terminates TLS in
+// front of the app, so the socket peer is the proxy. Without this, req.ip is
+// the proxy and express-rate-limit becomes one global bucket (a handful of
+// logins would lock out the whole site). Default to one trusted hop; set
+// TRUST_PROXY to a number, or an Express proxy-addr expression, to match a
+// deployment with a different topology.
+const TRUST_PROXY = process.env.TRUST_PROXY;
+app.set('trust proxy', TRUST_PROXY
+  ? (/^\d+$/.test(TRUST_PROXY) ? Number(TRUST_PROXY) : TRUST_PROXY)
+  : 1);
+function fatalConfig(message) {
+  console.error('[security] ' + message);
+  if (IN_FUNCTION) throw new Error('[security] ' + message);
+  process.exit(1);
+}
 
 // Secrets come from the environment only. A development fallback keeps `npm
 // start` frictionless, but production refuses to boot on a default secret
@@ -38,12 +57,10 @@ const KNOWN_PLACEHOLDER_SECRETS = new Set([
   'change-me-to-a-long-random-secret-in-production-min-32-chars',
 ]);
 if (IS_PROD && KNOWN_PLACEHOLDER_SECRETS.has(JWT_SECRET)) {
-  console.error('[security] Refusing to start: JWT_SECRET is unset or still the documented placeholder. Generate one with: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"');
-  process.exit(1);
+  fatalConfig('Refusing to start: JWT_SECRET is unset or still the documented placeholder. Generate one with: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"');
 }
 if (JWT_SECRET.length < 32) {
-  console.error('[security] Refusing to start: JWT_SECRET must be at least 32 characters.');
-  process.exit(1);
+  fatalConfig('Refusing to start: JWT_SECRET must be at least 32 characters.');
 }
 const ADMIN_SETUP_KEY = process.env.ADMIN_SETUP_KEY || '';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '12h';
@@ -53,6 +70,9 @@ const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '12h';
 // handlers), so a strict script-src is achievable and blocks script injection.
 // 'unsafe-inline' is granted to styles only, because layout utilities use style
 // attributes; it is not a script execution vector.
+// Candidate photos uploaded to Supabase Storage are served from the project
+// origin, so the strict img-src has to allow exactly that host and nothing else.
+const SUPABASE_ORIGIN = (process.env.SUPABASE_URL || '').trim().replace(/\/$/, '');
 app.use(helmet({
   contentSecurityPolicy: {
     useDefaults: false,
@@ -60,7 +80,7 @@ app.use(helmet({
       'default-src': ["'self'"],
       'script-src': ["'self'"],
       'style-src': ["'self'", "'unsafe-inline'"],
-      'img-src': ["'self'", 'data:', 'blob:'],
+      'img-src': ["'self'", 'data:', 'blob:', ...(SUPABASE_ORIGIN ? [SUPABASE_ORIGIN] : [])],
       'font-src': ["'self'"],
       'connect-src': ["'self'"],
       'object-src': ["'none'"],
@@ -126,8 +146,17 @@ app.use('/api/elections/:id/vote', voteLimiter);
 // keyed on the declared MIME type, never from the client-supplied filename, so
 // an attacker cannot land an .html/.svg payload that the browser would execute
 // when served back from our own origin.
+//
+// Files are held in memory rather than on disk: on Netlify (and any serverless
+// host) the filesystem is ephemeral and read-only. When Supabase Storage is
+// configured the bytes go to a public bucket; otherwise (local dev and the test
+// suites) they are written to uploads/ and served by the static handler below.
 const uploadDir = path.join(__dirname, '..', 'uploads');
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+// On serverless hosts the bundle filesystem is read-only, so this must never
+// throw at import time. When Supabase Storage is configured nothing is written
+// here; local dev and the test suites still get a real directory.
+try { if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true }); }
+catch { /* read-only filesystem: rely on Supabase Storage */ }
 const EXT_BY_MIME = {
   'image/jpeg': '.jpg',
   'image/png': '.png',
@@ -137,15 +166,8 @@ const EXT_BY_MIME = {
 const MIME_BY_EXT = Object.fromEntries(
   Object.entries(EXT_BY_MIME).map(([mime, ext]) => [ext, mime]),
 );
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const ext = EXT_BY_MIME[file.mimetype] || '.img';
-    cb(null, 'candidate-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex') + ext);
-  },
-});
 const upload = multer({
-  storage,
+  storage: multer.memoryStorage(),
   limits: { fileSize: 3 * 1024 * 1024, files: 1 },
   fileFilter: (req, f, cb) => {
     if (EXT_BY_MIME[f.mimetype]) return cb(null, true);
@@ -159,17 +181,9 @@ const upload = multer({
 // bytes really are an image before anything is kept, so a script or HTML
 // payload announced as image/png is rejected instead of stored. The stored
 // name is still derived from the allowlist, never from the client's filename.
-function sniffImageExtension(filePath) {
-  let head;
-  try {
-    const fd = fs.openSync(filePath, 'r');
-    try {
-      head = Buffer.alloc(16);
-      const read = fs.readSync(fd, head, 0, 16, 0);
-      head = head.subarray(0, read);
-    } finally { fs.closeSync(fd); }
-  } catch { return null; }
-
+function sniffImageBuffer(buffer) {
+  if (!buffer || buffer.length < 3) return null;
+  const head = buffer.subarray(0, 16);
   // JPEG: FF D8 FF
   if (head.length >= 3 && head[0] === 0xff && head[1] === 0xd8 && head[2] === 0xff) return '.jpg';
   // PNG: 89 50 4E 47 0D 0A 1A 0A
@@ -183,34 +197,38 @@ function sniffImageExtension(filePath) {
   return null;
 }
 
-// Wraps the multer middleware: on success the temp file is verified and any
-// file that fails sniffing is removed before the route handler can store it.
+// Wraps the multer middleware: on success the buffer is verified and any file
+// that fails sniffing is rejected before the route handler can store it.
 function verifiedUpload(req, res, next) {
   upload.single('photo')(req, res, (err) => {
     if (err) return next(err);
     if (!req.file) return next();
-    const sniffed = sniffImageExtension(req.file.path);
+    const sniffed = sniffImageBuffer(req.file.buffer);
     if (!sniffed) {
-      try { fs.unlinkSync(req.file.path); } catch { /* best effort */ }
       const e = new Error('File content is not a valid JPEG, PNG, WebP or GIF image');
       e.status = 400;
       return next(e);
     }
-    // Rename to the sniffed extension so the stored name always matches the bytes.
-    if (sniffed !== path.extname(req.file.path)) {
-      try {
-        const target = req.file.path.slice(0, -path.extname(req.file.path).length) + sniffed;
-        fs.renameSync(req.file.path, target);
-        req.file.path = target;
-        req.file.filename = path.basename(target);
-      } catch { /* keep the original name if the rename fails */ }
-    }
-    // Report the type we actually verified, not the one the client claimed.
+    // Record the type we actually verified, not the one the client claimed.
+    req.file.sniffedExt = sniffed;
     req.file.mimetype = MIME_BY_EXT[sniffed] || req.file.mimetype;
     return next();
   });
 }
-// Serve uploads inertly: never sniffed, never executed, never framed.
+
+// Persists a verified upload and returns the URL stored in candidates.photo_url:
+// Supabase Storage in production, local disk as the development/test fallback.
+async function persistCandidatePhoto(file) {
+  const ext = file.sniffedExt || '.img';
+  if (supabase.isStorageConfigured()) {
+    return supabase.uploadCandidatePhoto(file.buffer, ext, file.mimetype);
+  }
+  const filename = 'candidate-' + Date.now() + '-' + crypto.randomBytes(8).toString('hex') + ext;
+  fs.writeFileSync(path.join(uploadDir, filename), file.buffer);
+  return '/uploads/' + filename;
+}
+// Serve uploads inertly: never sniffed, never executed, never framed. Only the
+// local-disk fallback writes here; Supabase Storage URLs bypass it entirely.
 app.use('/uploads', express.static(uploadDir, {
   index: false,
   setHeaders: (res) => {
@@ -946,7 +964,7 @@ app.post('/api/admin/candidates', adminOnly, verifiedUpload, async (req, res) =>
   if (!election_id || !position_id || !name) return res.status(400).json({ error: 'Election, position and name required' });
   const pos = await db.prepare('SELECT * FROM positions WHERE id=? AND election_id=?').get(position_id, election_id);
   if (!pos) return res.status(400).json({ error: 'Position does not belong to this election' });
-  const photo_url = req.file ? ('/uploads/' + req.file.filename) : '';
+  const photo_url = req.file ? await persistCandidatePhoto(req.file) : '';
   const info = await db.prepare('INSERT INTO candidates(election_id,position_id,name,student_id,department,faculty,level,affiliation,bio,manifesto,photo_url,sort_order) VALUES(?,?,?,?,?,?,?,?,?,?,?,?) RETURNING id')
     .run(election_id, position_id, name, student_id||'', department||'', faculty||'', level||'', affiliation||'Independent', bio||'', manifesto||'', photo_url, Number(sort_order)||0);
   audit(req.user.id, 'admin.candidate_create', `${name} #${info.lastInsertRowid}`, req);
@@ -964,7 +982,7 @@ app.put('/api/admin/candidates/:cid', adminOnly, verifiedUpload, async (req, res
     if (!target) return res.status(400).json({ error: 'Position does not belong to this election' });
     positionId = target.id;
   }
-  const photo_url = req.file ? ('/uploads/' + req.file.filename) : (b.photo_url ?? c.photo_url);
+  const photo_url = req.file ? await persistCandidatePhoto(req.file) : (b.photo_url ?? c.photo_url);
   await db.prepare('UPDATE candidates SET name=COALESCE(?,name), student_id=COALESCE(?,student_id), department=COALESCE(?,department), faculty=COALESCE(?,faculty), level=COALESCE(?,level), affiliation=COALESCE(?,affiliation), bio=COALESCE(?,bio), manifesto=COALESCE(?,manifesto), photo_url=?, sort_order=COALESCE(?,sort_order), position_id=? WHERE id=?')
     .run(b.name??null, b.student_id??null, b.department??null, b.faculty??null, b.level??null, b.affiliation??null, b.bio??null, b.manifesto??null, photo_url, b.sort_order??null, positionId, c.id);
   audit(req.user.id, 'admin.candidate_update', `#${c.id} (${c.name})`, req);
@@ -1384,10 +1402,10 @@ app.get('*', (req, res, next) => {
   res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
-// Background job: auto-close elections whose end date has passed.
-// Interval configurable via SCHEDULER_MS (default 60s; tests use ~1s).
-const SCHEDULER_MS = Number(process.env.SCHEDULER_MS || 60000);
-setInterval(async () => {
+// Background job: auto-close elections whose end date has passed. Runs on an
+// interval in the long-lived server, and once per invocation from the Netlify
+// scheduled function (netlify/functions/scheduler.js).
+async function autoCloseElections() {
   try {
     // Compared in JS so the whole batch shares a single `now` and ends_at (a
     // timestamptz, read back as ISO-8601) is evaluated against the server clock
@@ -1401,43 +1419,57 @@ setInterval(async () => {
       console.log(`[scheduler] auto-closed election #${e.id}`);
     }
   } catch (err) { console.error('[scheduler]', err.message); }
-}, SCHEDULER_MS).unref();
-
-const httpServer = app.listen(PORT, () => {
-  console.log(`UNIVERSITY E-VOTING SYSTEM running on http://localhost:${PORT}`);
-  if (!process.env.JWT_SECRET) console.warn('[security] JWT_SECRET is not set — using an insecure default. Set a long random value in production.');
-  console.log(`[db] backend: ${supabase.isConfigured() ? 'Supabase Postgres' : 'SQLite (legacy)'}`);
-});
-
-// Graceful shutdown. A SIGTERM (from a process manager or a host's deploy
-// pipeline) lands here: in-flight requests finish, then the Postgres pool
-// closes. Without this, a deploy would sever live vote requests and leave the
-// pool leaking sockets until the process was killed.
-let shuttingDown = false;
-async function gracefulShutdown(signal) {
-  if (shuttingDown) return;
-  shuttingDown = true;
-  console.log(`[shutdown] ${signal} received, draining...`);
-
-  // Backstop only. Whatever supervises this process should allow at least
-  // this long to drain before escalating to SIGKILL.
-  const force = setTimeout(() => {
-    console.error('[shutdown] drain timed out after 15s, exiting');
-    process.exit(1);
-  }, 15000);
-  force.unref();
-
-  httpServer.close(async () => {
-    try {
-      await supabase.shutdown();
-    } catch (err) {
-      console.error('[shutdown] error closing database pool:', err.message);
-    }
-    clearTimeout(force);
-    console.log('[shutdown] complete');
-    process.exit(0);
-  });
 }
 
-process.on('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
-process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });
+// The Express app is exported so a serverless wrapper can mount it, and
+// autoCloseElections is shared with the scheduled function.
+module.exports = { app, autoCloseElections };
+
+// Everything below runs only when this file is the process entry point
+// (`node src/server.js`, `npm start`, and the test suites). Under Netlify
+// Functions the module is require()d, so no port is opened and no interval is
+// scheduled; the function wrapper handles requests instead.
+if (require.main === module) {
+  // Interval configurable via SCHEDULER_MS (default 60s; tests use ~1s).
+  const SCHEDULER_MS = Number(process.env.SCHEDULER_MS || 60000);
+  setInterval(() => { autoCloseElections(); }, SCHEDULER_MS).unref();
+
+  const httpServer = app.listen(PORT, () => {
+    console.log(`UNIVERSITY E-VOTING SYSTEM running on http://localhost:${PORT}`);
+    if (!process.env.JWT_SECRET) console.warn('[security] JWT_SECRET is not set — using an insecure default. Set a long random value in production.');
+    console.log(`[db] backend: ${supabase.isConfigured() ? 'Supabase Postgres' : 'not configured'}`);
+  });
+
+  // Graceful shutdown. A SIGTERM (from a process manager or a host's deploy
+  // pipeline) lands here: in-flight requests finish, then the Postgres pool
+  // closes. Without this, a deploy would sever live vote requests and leave the
+  // pool leaking sockets until the process was killed.
+  let shuttingDown = false;
+  async function gracefulShutdown(signal) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[shutdown] ${signal} received, draining...`);
+
+    // Backstop only. Whatever supervises this process should allow at least
+    // this long to drain before escalating to SIGKILL.
+    const force = setTimeout(() => {
+      console.error('[shutdown] drain timed out after 15s, exiting');
+      process.exit(1);
+    }, 15000);
+    force.unref();
+
+    httpServer.close(async () => {
+      try {
+        await supabase.shutdown();
+      } catch (err) {
+        console.error('[shutdown] error closing database pool:', err.message);
+      }
+      clearTimeout(force);
+      console.log('[shutdown] complete');
+      process.exit(0);
+    });
+  }
+
+  process.on('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
+  process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });
+}

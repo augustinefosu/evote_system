@@ -1,17 +1,44 @@
-# Netlify is used here ONLY as a static preview of the frontend.
+# Netlify configuration.
 #
-# This project is an Express app: the API, authentication and voting run in
-# src/server.js, which Netlify cannot execute. Login, voting and every /api/...
-# call will still return 404 on this deploy. The working app runs on Render
-# (see render.yaml and the README).
-#
-# What this file does:
-#   * overrides the Netlify UI build command, so the missing `npm run build`
-#     script no longer fails the build;
-#   * publishes public/ at the site root, so the pages load at "/" and the
-#     repository source (server code, tests, schema) is no longer downloadable.
-#
-# The [build] settings in netlify.toml take precedence over the Netlify UI.
+# The static frontend is served from public/, and /api/* is rewritten to the
+# Express app running as a Netlify Function (netlify/functions/api.js).
+# Supabase provides the database, auth and object storage.
+
 [build]
-  command = "echo 'Static preview only - the API runs on Render'"
+  command = "npm ci"
   publish = "public"
+
+[functions]
+  # express and pg-native are left unbundled: express bundles poorly, and `pg`
+  # optionally requires the native pg-native addon inside a try/catch.
+  external_node_modules = ["express", "pg-native"]
+  node_bundler = "esbuild"
+
+# Scheduled auto-close of elections whose end time has passed. The long-lived
+# server runs this on an interval; here Netlify invokes the `scheduler` function
+# on the cron below. Keep the cadence at or above the free-plan minimum.
+[functions."scheduler"]
+  schedule = "*/5 * * * *"
+
+# Route the API to the Express function. The function normalizes the path, so it
+# works whether it receives /api/... or the internal /.netlify/functions/... one.
+[[redirects]]
+  from = "/api/*"
+  to = "/.netlify/functions/api/:splat"
+  status = 200
+  force = true
+
+# Security headers for the statically served pages, mirroring what helmet sets
+# on API responses in src/server.js. img-src allows Supabase Storage for
+# candidate photos (https://<ref>.supabase.co).
+[[headers]]
+  for = "/*"
+  [headers.values]
+    Content-Security-Policy = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https://*.supabase.co; font-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'; upgrade-insecure-requests"
+    X-Content-Type-Options = "nosniff"
+    X-Frame-Options = "DENY"
+    Referrer-Policy = "no-referrer"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
+    Strict-Transport-Security = "max-age=31536000; includeSubDomains"
+    Cross-Origin-Opener-Policy = "same-origin"
+    Cross-Origin-Resource-Policy = "same-origin"

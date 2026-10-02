@@ -7,6 +7,10 @@
 [build]
   command = "npm ci"
   publish = "public"
+
+# Secrets-scanning controls must be build environment variables; Netlify
+# ignores them as plain [build] keys.
+[build.environment]
   # NODE_ENV, SUPABASE_DB_SSL and SUPABASE_STORAGE_BUCKET are configuration,
   # not credentials, but their values ("production", "no-verify",
   # "candidate-photos") legitimately appear in source, tests, the docs and the

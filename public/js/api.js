@@ -53,7 +53,15 @@ async function parseResponse(res) {
   const text = await res.text();
   try { data = text ? JSON.parse(text) : {}; } catch { data = { error: text.slice(0, 200) }; }
   if (!res.ok) {
-    const err = new Error(data.error || `Request failed (${res.status})`);
+    // If the server (or a gateway) did not return a JSON error, turn the
+    // status into something a student can act on instead of "Request failed
+    // (502)". The API's own JSON message always wins when present.
+    const fallback = {
+      502: 'The service is temporarily unavailable. Please try again shortly.',
+      503: 'The service is temporarily unavailable. Please try again shortly.',
+      504: 'The service timed out. Please try again shortly.',
+    }[res.status] || `Request failed (${res.status})`;
+    const err = new Error(data.error || fallback);
     err.status = res.status;
     throw err;
   }

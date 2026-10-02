@@ -32,9 +32,15 @@ const DB_URL = (process.env.SUPABASE_DB_URL || '').trim();
 function sslOption() {
   const mode = (process.env.SUPABASE_DB_SSL || 'true').trim().toLowerCase();
   if (['false', '0', 'off', 'disable', 'disabled'].includes(mode)) return false;
-  // Supabase presents a certificate that is usually absent from the local CA
-  // bundle, so full verification fails on developer machines by default. Set
-  // SUPABASE_DB_SSL=true on infrastructure that has the root certificate.
+  // Pinning Supabase's own CA is the secure way to verify the pooler
+  // certificate, which is not present in Node's default trust store. Accept
+  // literal "\n" escapes because dashboards usually store a PEM on one line.
+  const ca = process.env.SUPABASE_DB_CA;
+  if (ca && ca.trim()) return { ca: ca.replace(/\\n/g, '\n'), rejectUnauthorized: true };
+  // Supabase presents a certificate that is usually absent from the CA bundle,
+  // so full verification fails on most hosts, including Netlify Functions.
+  // no-verify keeps TLS but skips server authentication; prefer SUPABASE_DB_CA
+  // or SUPABASE_DB_SSL=true where the CA is available.
   if (['no-verify', 'insecure', 'skip-verify'].includes(mode)) {
     return { rejectUnauthorized: false };
   }

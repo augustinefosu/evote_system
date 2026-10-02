@@ -192,8 +192,10 @@ ephemeral.
 1. Supabase Dashboard → Storage → **New bucket** → `candidate-photos` → mark it **public**.
 2. Site configuration → **Environment variables** → add `SUPABASE_URL`,
    `SUPABASE_SERVICE_ROLE_KEY`, `SUPABASE_DB_URL`, `SUPABASE_STORAGE_BUCKET=candidate-photos`,
-   `ADMIN_SETUP_KEY` and a strong `JWT_SECRET`. Set `SUPABASE_DB_SSL=no-verify` only if the
-   deployment cannot verify Supabase's certificate (pin the CA and use `true` for production).
+   `NODE_ENV=production`, `ADMIN_SETUP_KEY` and a strong `JWT_SECRET`. Netlify provides neither
+   `NODE_ENV` nor Supabase's CA, so also set **`SUPABASE_DB_SSL=no-verify`** (or pin the certificate
+   with `SUPABASE_DB_CA`). Without one of these the first database query in a request rejects and
+   Netlify answers a bare **502**.
 3. Connect the repo and deploy. `netlify/functions/api.js` serves `/api/*`; the scheduled
    `netlify/functions/scheduler.js` closes elections whose end time has passed (every 5 minutes).
 4. Apply `supabase/schema.sql` once from a machine (`npm run db:migrate`) before the first request —
@@ -204,6 +206,15 @@ ephemeral.
 Function invocations are short-lived and may cold-start; the app does its auth checks per request,
 and the scheduled function replaces the in-process `SCHEDULER_MS` interval, which does not exist on
 serverless.
+
+**502 on every API call?** The function could not complete, usually because of a missing or wrong
+environment variable rather than an application bug. `GET /api/health` returns a `config` object
+with a boolean for each expected variable (never their values) and a `config_errors` list, so the
+gap is visible without opening the function logs; the deployment log also prints a one-line
+`[config]` summary at startup and an `[api-error] ... operator hint` for each failed query. The most
+common causes are `SUPABASE_DB_SSL` left unset (Supabase's certificate is not in Netlify's trust
+store) and `SUPABASE_DB_URL` pointing at the IPv6-only direct database host instead of the Supavisor
+pooler.
 
 ### Render
 
@@ -254,8 +265,10 @@ brew install libpq
 
 - [ ] `SUPABASE_DB_URL` set with a **percent-encoded** password, using the Supavisor pooler
       hostname (the direct `db.<ref>` host is IPv6-only and fails on IPv4-only networks).
-- [ ] `SUPABASE_DB_SSL=true` in production. `no-verify` is a developer-machine convenience for
-      Supabase's certificate not being in the local CA bundle; keep it strictly `true` on the host.
+- [ ] Database TLS verified: set `SUPABASE_DB_CA` to Supabase's CA (or keep the `SUPABASE_DB_SSL=true`
+      default, which requires the CA in the host trust store). Hosts without the CA, including
+      Netlify Functions, must set `SUPABASE_DB_SSL=no-verify` — this still encrypts the connection
+      but skips authentication of the server certificate.
 - [ ] Service role key supplied through the host's secret store only, never in a committed file and
       never in the browser. It bypasses Row Level Security entirely.
 - [ ] On serverless (Netlify): a **public** `candidate-photos` bucket and `SUPABASE_STORAGE_BUCKET`

@@ -6,6 +6,12 @@ try { require('dotenv'); } catch {}
 require('./env');
 
 const express = require('express');
+// Express 4 does not forward rejections from `async` route handlers to the error
+// middleware. Without this, a failed database call inside (for example)
+// registration becomes an unhandled rejection, and on Netlify Functions that
+// kills the invocation and surfaces as an opaque 502 with no JSON body. This
+// patch routes those rejections to the JSON error handler further down.
+require('express-async-errors');
 const helmet = require('helmet');
 const cors = require('cors');
 const morgan = require('morgan');
@@ -40,13 +46,20 @@ app.set('trust proxy', TRUST_PROXY
   : 1);
 function fatalConfig(message) {
   console.error('[security] ' + message);
-  if (IN_FUNCTION) throw new Error('[security] ' + message);
-  process.exit(1);
+  CONFIG_ERRORS.push(message);
+  // A long-lived server refuses to boot. In a serverless function, throwing at
+  // import time would make Netlify answer every request with an opaque 502, so
+  // the problem is recorded and reported per request by the middleware below.
+  if (!IN_FUNCTION) process.exit(1);
 }
 
+// Configuration problems that must stop auth/database work. Populated at import
+// time and surfaced to operators via /api/health and to clients as a 503.
+const CONFIG_ERRORS = [];
+
 // Secrets come from the environment only. A development fallback keeps `npm
-// start` frictionless, but production refuses to boot on a default secret
-// rather than silently running with a publicly known signing key.
+// start` frictionless, but production refuses to run on a default secret rather
+// than silently signing tokens with a publicly known key.
 const DEV_JWT_SECRET = 'dev-only-insecure-secret-change-me-0123456789abcdef';
 const JWT_SECRET = process.env.JWT_SECRET || DEV_JWT_SECRET;
 // Values that are published in .env.example, the README, or the source itself.
@@ -57,12 +70,44 @@ const KNOWN_PLACEHOLDER_SECRETS = new Set([
   'change-me-to-a-long-random-secret-in-production-min-32-chars',
 ]);
 if (IS_PROD && KNOWN_PLACEHOLDER_SECRETS.has(JWT_SECRET)) {
-  fatalConfig('Refusing to start: JWT_SECRET is unset or still the documented placeholder. Generate one with: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"');
+  fatalConfig('JWT_SECRET is unset or still the documented placeholder. Generate one with: node -e "console.log(require(\'crypto\').randomBytes(48).toString(\'hex\'))"');
 }
 if (JWT_SECRET.length < 32) {
-  fatalConfig('Refusing to start: JWT_SECRET must be at least 32 characters.');
+  fatalConfig('JWT_SECRET must be at least 32 characters.');
 }
 const ADMIN_SETUP_KEY = process.env.ADMIN_SETUP_KEY || '';
+
+// When required configuration is missing, fail every API call with an explicit
+// 503 instead of letting a route crash the function. /api/health stays
+// reachable so the operator can see exactly what is wrong.
+if (CONFIG_ERRORS.length) {
+  app.use((req, res, next) => {
+    if (!req.path.startsWith('/api/') || req.path === '/api/health') return next();
+    res.status(503).json({ error: 'Server configuration error: ' + CONFIG_ERRORS.join('; ') });
+  });
+}
+
+// One-line configuration summary for the logs. On Netlify it appears under
+// Functions -> api -> logs and shows at a glance which variables a deployment
+// is missing. Presence flags only; never the values.
+console.log('[config] ' + JSON.stringify({
+  node_env: process.env.NODE_ENV || '(unset)',
+  supabase_url: Boolean(process.env.SUPABASE_URL),
+  supabase_service_role_key: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+  supabase_db_url: Boolean(process.env.SUPABASE_DB_URL),
+  supabase_db_ssl: process.env.SUPABASE_DB_SSL || 'true (default)',
+  supabase_storage_bucket: Boolean(process.env.SUPABASE_STORAGE_BUCKET),
+  admin_setup_key: Boolean(process.env.ADMIN_SETUP_KEY),
+  jwt_secret: KNOWN_PLACEHOLDER_SECRETS.has(JWT_SECRET) ? 'placeholder' : 'ok',
+  config_errors: CONFIG_ERRORS,
+}));
+
+// Last-resort safety net: a rejection that escapes a route is logged rather
+// than terminating a warm function container outright. Route rejections are
+// already handled by express-async-errors above; this only catches stray work.
+process.on('unhandledRejection', (reason) => {
+  console.error('[unhandledRejection]', reason && reason.stack ? reason.stack : reason);
+});
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '12h';
 
 // Content-Security-Policy is enabled deliberately. Every page loads its
@@ -441,7 +486,27 @@ app.get('/api/health', async (req, res) => {
     dbOk = false;
     console.error('[health] backend check failed:', err.message);
   }
-  res.status(dbOk ? 200 : 503).json({ status: dbOk ? 'ok' : 'degraded', time: new Date().toISOString(), db: dbOk ? 'up' : 'down', backend });
+  // Presence, not values: safe to expose publicly and it tells an operator at a
+  // glance which environment variable a broken deployment is missing.
+  const config = {
+    node_env: process.env.NODE_ENV || '(unset)',
+    supabase_url: Boolean(process.env.SUPABASE_URL),
+    supabase_service_role_key: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+    supabase_db_url: Boolean(process.env.SUPABASE_DB_URL),
+    supabase_db_ssl: process.env.SUPABASE_DB_SSL || 'true (default)',
+    supabase_storage_bucket: Boolean(process.env.SUPABASE_STORAGE_BUCKET),
+    admin_setup_key: Boolean(process.env.ADMIN_SETUP_KEY),
+    jwt_secret: KNOWN_PLACEHOLDER_SECRETS.has(JWT_SECRET) ? 'placeholder' : 'ok',
+    config_errors: CONFIG_ERRORS,
+  };
+  const healthy = dbOk && CONFIG_ERRORS.length === 0;
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? 'ok' : 'degraded',
+    time: new Date().toISOString(),
+    db: dbOk ? 'up' : 'down',
+    backend,
+    config,
+  });
 });
 app.post('/api/auth/register', async (req, res) => {
   const allow = await db.prepare("SELECT value FROM settings WHERE key='allow_registration'").get();
@@ -1388,13 +1453,62 @@ app.post('/api/setup/superadmin', async (req, res) => {
 });
 
 // ---------- static frontend ----------
-// JSON error responses for API routes (e.g. multer upload rejections),
-// so clients never receive an HTML error page from /api/*.
+// JSON error responses for API routes (e.g. multer upload rejections), so
+// clients never receive an HTML error page from /api/*. Together with
+// express-async-errors this also catches rejections from async handlers, which
+// is what keeps a failed database call from becoming a platform-level 502.
+//
+// Internal detail is logged, never returned; the client gets an actionable but
+// non-sensitive message.
+function describeDbError(err) {
+  const m = String((err && err.message) || '');
+  if (/self-signed certificate|certificate chain|unable to verify|certificate/i.test(m)) {
+    return 'TLS certificate for the database could not be verified; set SUPABASE_DB_SSL=no-verify (or pin SUPABASE_DB_CA) on the host';
+  }
+  if (/ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|timeout expired|Connection terminated|server closed the connection/i.test(m)) {
+    return 'cannot reach Postgres; check SUPABASE_DB_URL and the Supabase pooler host/port';
+  }
+  if (/password authentication failed|role .* does not exist/i.test(m)) {
+    return 'database authentication failed; check the percent-encoded password in SUPABASE_DB_URL';
+  }
+  if (/does not exist|undefined column|undefined table/i.test(m)) {
+    return 'schema mismatch; run npm run db:migrate against the live database';
+  }
+  return null;
+}
+
 app.use((err, req, res, next) => {
   if (!req.path.startsWith('/api/')) return next(err);
-  console.error('[api-error]', err.message);
+  console.error('[api-error]', err && (err.stack || err.message));
+
+  // Missing/invalid server configuration, recorded at import time.
+  if (err.code === 'CONFIG') {
+    return res.status(503).json({ error: 'Server configuration error: ' + err.message });
+  }
+
+  // Unique-constraint races: the friendly pre-check usually catches duplicates,
+  // but two simultaneous registrations can slip past it. Postgres reports 23505.
+  if (err.code === '23505') {
+    const target = String(err.constraint || err.detail || '');
+    if (/email/i.test(target)) return res.status(409).json({ error: 'Email already registered' });
+    if (/student_id|student/i.test(target)) return res.status(409).json({ error: 'Student ID already registered' });
+    return res.status(409).json({ error: 'That record already exists' });
+  }
+
+  // Only classify driver-level failures. A route that set `err.status` has
+  // already decided what the client should see, so never override it.
+  const hint = err.status ? null : describeDbError(err);
+  if (hint) {
+    console.error('[api-error] operator hint: ' + hint);
+    return res.status(503).json({ error: 'Database connection failed. Please try again shortly.' });
+  }
+
   const status = err.status || (/LIMIT_|Only .* allowed/.test(err.message) ? 400 : 500);
-  res.status(status).json({ error: err.message || 'Request failed' });
+  if (status < 500) return res.status(status).json({ error: err.message });
+  const generic = req.path.endsWith('/auth/register')
+    ? 'Registration service temporarily unavailable. Please try again shortly.'
+    : 'Service temporarily unavailable. Please try again shortly.';
+  res.status(500).json({ error: generic });
 });
 app.use(express.static(path.join(__dirname, '..', 'public')));
 app.get('*', (req, res, next) => {

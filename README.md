@@ -180,6 +180,28 @@ a port (Railway, Render, Fly.io, a VM behind Caddy/Nginx, or `node src/server.js
 There is no container definition in this repository; run the app directly or add a host-specific
 one.
 
+> **Not a static site.** Netlify, GitHub Pages and similar static-only hosts cannot run this app.
+> The API, authentication and voting execute inside `src/server.js`, and the frontend calls
+> `/api/...` same-origin (`public/js/api.js`), so the API and pages must be served from one origin.
+
+### Render
+
+`render.yaml` is a ready-made blueprint: one Node web service that runs the API and serves the
+static pages on one origin.
+
+1. Render Dashboard → **New → Blueprint** → select this repo → **Apply**.
+2. Fill in the values Render prompts for: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`,
+   `SUPABASE_DB_URL` and `ADMIN_SETUP_KEY`. `JWT_SECRET` is generated for you.
+3. The start command runs `npm run db:migrate` before `npm start`, so the schema is applied on
+   every boot (the free plan has no pre-deploy command; on a paid plan move it to
+   `preDeployCommand`).
+4. After the first deploy, call `POST /api/setup/superadmin` with `ADMIN_SETUP_KEY` to create the
+   first administrator, then delete that variable.
+
+Free instances sleep after ~15 minutes idle, so the first request after a pause wakes the service.
+Render injects `RENDER_EXTERNAL_URL`, which `src/mailer.js` uses for email links — set `APP_URL`
+only if you attach a custom domain.
+
 ```powershell
 npm ci --omit=dev      # install
 npm run db:migrate     # apply supabase/schema.sql (idempotent) — run before first start

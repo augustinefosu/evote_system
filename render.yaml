@@ -1,0 +1,52 @@
+# Render Blueprint — https://render.com/docs/blueprint-spec
+#
+# Deploys the whole Express app (API + static frontend) on ONE origin, which is
+# what the frontend's same-origin cookies and CSRF protection require. Supabase
+# stays the database; only this web service moves to Render.
+#
+# How to use:
+#   Render Dashboard -> New -> Blueprint -> select this repo -> Apply.
+#   Render prompts for every `sync: false` value below. Fill them in, then deploy.
+services:
+  - type: web
+    name: university-evoting-system
+    runtime: node
+    plan: free # free instances sleep after ~15 min idle; first hit cold-starts
+    region: oregon # or frankfurt / ohio / singapore
+    branch: main
+    buildCommand: npm ci
+    # The free plan does not offer a pre-deploy command, so the (idempotent)
+    # schema migration is chained before the server starts. On a paid plan,
+    # use `preDeployCommand: npm run db:migrate` and set startCommand to
+    # `npm start` instead.
+    startCommand: npm run db:migrate && npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: NODE_VERSION
+        value: "22"
+      # --- Secrets: Render prompts for each of these on first deploy ---------
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Percent-encoded password, Supavisor pooler host, port 6543.
+      - key: SUPABASE_DB_URL
+        sync: false
+      # Used once to bootstrap the first super-admin, then delete it.
+      - key: ADMIN_SETUP_KEY
+        sync: false
+      # --- Non-secret defaults -----------------------------------------------
+      # Supabase's pooler certificate chain is not in Node's bundled CA store.
+      # Switch to `true` once you pin the Supabase CA (see README checklist).
+      - key: SUPABASE_DB_SSL
+        value: no-verify
+      - key: SUPABASE_DB_POOL
+        value: "5"
+      - key: JWT_SECRET
+        generateValue: true # Render generates and stores a strong secret
+      # APP_URL is auto-detected from RENDER_EXTERNAL_URL (see src/mailer.js).
+      # Uncomment and set only if you attach a custom domain.
+      # - key: APP_URL
+      #   sync: false

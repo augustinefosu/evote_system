@@ -17,7 +17,9 @@ if (configured) {
 }
 
 const FROM = process.env.MAIL_FROM || 'University E-Voting <no-reply@university.edu>';
-const APP_URL = (process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '');
+// APP_URL wins; on Render, RENDER_EXTERNAL_URL is injected automatically so
+// emailed links are correct without extra setup.
+const APP_URL = (process.env.APP_URL || process.env.RENDER_EXTERNAL_URL || 'http://localhost:3000').replace(/\/$/, '');
 
 async function sendMail(to, subject, text, html) {
   if (!transporter) {

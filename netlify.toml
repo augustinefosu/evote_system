@@ -7,6 +7,13 @@
 [build]
   command = "npm ci"
   publish = "public"
+  # NODE_ENV and SUPABASE_DB_SSL are configuration, not secrets, but their
+  # values ("production", "no-verify") necessarily appear in the source
+  # (`process.env.NODE_ENV === 'production'`), in README.md and in render.yaml.
+  # Netlify's secrets scanner flags those literals and fails the build, so omit
+  # just these two non-secret keys. Real secrets (JWT_SECRET, ADMIN_SETUP_KEY,
+  # the Supabase keys) stay scanned.
+  SECRETS_SCAN_OMIT_KEYS = "NODE_ENV,SUPABASE_DB_SSL"
 
 [functions]
   # express and pg-native are left unbundled: express bundles poorly, and `pg`
